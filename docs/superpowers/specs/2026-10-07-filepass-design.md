@@ -1,7 +1,7 @@
 # filepass — design
 
 Date: 2026-10-07
-Status: draft, revised after review, awaiting approval
+Status: draft, revised after review and threat-model pass, awaiting approval
 License: MIT
 Repo: `daniel-butler/filepass`
 
@@ -12,7 +12,9 @@ filepass carries the attachments: agent A uploads a file, gets back a URL,
 and pastes that URL into its message to agent B. B downloads it with `curl`.
 
 filepass is a single Rust binary that runs on a locked-down server behind a
-TLS-terminating reverse proxy. It stores nothing permanent: every file expires,
+TLS-terminating reverse proxy. It faces the public internet: agents reach it
+from wherever they run, so no network allowlist protects it. One operator owns
+every agent; the agent name is the only identity. It stores nothing permanent: every file expires,
 by default after 30 minutes.
 
 ## Goals
@@ -22,6 +24,8 @@ by default after 30 minutes.
 - Each agent authenticates uploads with its own token.
 - Links expire. The uploader can revoke one early, and revocation is immediate.
 - The server never fills its disk, its inodes, or its memory.
+- Strangers on the internet cannot store files, guess tokens, or scan for
+  links at any useful rate.
 - Operators see what happens through structured logs and metric events.
 - Nothing leaves the server. No phone-home telemetry.
 
@@ -34,6 +38,7 @@ by default after 30 minutes.
 - TLS termination. The reverse proxy does it.
 - More than one server node.
 - A Prometheus endpoint.
+- More than one human user, or self-service token issuance.
 - Multi-range requests. A request for several ranges gets the whole file.
 
 ## HTTP API
@@ -132,6 +137,7 @@ Returns `200 ok`. No auth.
 | 408 | Upload stalled or exceeded `max_upload_duration` |
 | 410 | The file existed but has expired or been revoked |
 | 413 | Larger than `max_file_size` |
+| 429 | The client IP exhausted its failure budget, or the agent its upload rate |
 | 503 | Too many concurrent downloads |
 | 507 | Would exceed the agent's byte quota, its `max_files`, the total quota, or the free-space floor |
 
@@ -253,6 +259,28 @@ How filepass enforces them:
 The `max_files` limit counts tombstones so that upload-then-revoke loops cannot
 exhaust inodes or grow the index.
 
+## Abuse protection
+
+filepass faces the internet, so it enforces two rate limits itself rather than
+relying on a firewall or fail2ban.
+
+**Failure budget per client IP.** Every `401`, `403`, or `404` response
+charges the client IP one unit. An IP that spends `failure_budget` (20) units
+within `failure_window` (1m) is locked out for `failure_lockout` (10m): every
+request from it, valid or not, gets `429` with `Retry-After`. This makes token
+guessing and id scanning pointless; neither was feasible anyway against 256-
+and 128-bit secrets, but the budget also caps the load they cause. The client
+IP comes from the same source as logging (rightmost `X-Forwarded-For`, else
+the socket peer). filepass tracks at most `max_tracked_ips` (10,000) IPs and
+evicts the least recently seen.
+
+**Upload rate per agent.** Each agent may start `upload_rate` (60) uploads per
+minute, enforced with a token bucket. Excess uploads get `429` with
+`Retry-After` before the body is read. Quotas cap how much an agent stores;
+the rate caps how hard a leaked token can hit the server.
+
+Both limiters live in memory and reset on restart.
+
 ## Authentication
 
 Each agent has a random token: `fp_` followed by 32 random bytes in
@@ -286,6 +314,12 @@ max_upload_duration      = "1h"
 download_idle_timeout    = "60s"
 max_concurrent_downloads = 64
 shutdown_grace           = "30s"
+
+failure_budget           = 20          # failed requests per IP ...
+failure_window           = "1m"        # ... within this window
+failure_lockout          = "10m"
+max_tracked_ips          = 10000
+upload_rate              = 60          # uploads per agent per minute
 
 total_quota              = "50GiB"
 agent_quota              = "10GiB"     # default bytes per agent
@@ -333,6 +367,8 @@ at the same call site. Count the metric; read the log.
 | `time_to_first_download_ms` | timing | `agent` | first download of a file |
 | `expired_undownloaded` | counter | `agent` | sweeper expires a file never downloaded |
 | `revoke` | counter | `agent`, `result` | each DELETE |
+| `throttled` | counter | `reason` (`failure_budget`, `upload_rate`) | each `429` |
+| `ip_lockout` | counter | — | each time an IP is locked out |
 | `stored_bytes` | gauge | `agent`, plus `total` | each sweep |
 | `live_files` | gauge | — | each sweep |
 | `uploads_in_flight` | gauge | — | each sweep |
@@ -344,7 +380,7 @@ count as further downloads but never reset that time.
 
 `result` takes a fixed set of values: `ok`, `unauthorized`, `forbidden`,
 `not_found`, `gone`, `too_large`, `insufficient_storage`, `timeout`,
-`bad_request`, `busy`, `revoked`, `client_aborted`.
+`bad_request`, `busy`, `rate_limited`, `revoked`, `client_aborted`.
 
 Labels never include file ids or filenames, which keeps series count bounded.
 
@@ -382,6 +418,7 @@ reads those logs.
 | `upload.rs` | PUT handler: streaming, hashing, limits, timeouts |
 | `download.rs` | GET, HEAD, and DELETE handlers; range serving; cancellation |
 | `sweeper.rs` | Expiry, tombstone removal, gauge emission |
+| `limits.rs` | Per-IP failure budget and per-agent upload rate |
 | `obs.rs` | Metric event helpers |
 | `clock.rs` | `Clock` trait; system clock and a test clock |
 
@@ -441,6 +478,10 @@ Integration tests start the real server on a random port with a temp
 - DELETE ordering: `404`, `403`, `410`, `204`.
 - Revoke aborts a download in progress.
 - `503` beyond `max_concurrent_downloads`.
+- An IP that exceeds the failure budget gets `429` for every request until the
+  lockout ends (advance the test clock); other IPs are unaffected.
+- The IP table stays within `max_tracked_ips`.
+- An agent that exceeds `upload_rate` gets `429` before its body is read.
 - Range request returns the requested slice; resume reassembles the file.
 - Response headers: `nosniff`, `attachment`, octet-stream, `no-referrer`.
 - Startup recovery: every row of the recovery table.
@@ -456,6 +497,10 @@ derivation, and token hashing.
   `Filepass-To: builder` header. filepass records it in the metadata, and
   downloads then require that agent's token. Every agent already has a token,
   so this changes no setup.
+- **GitHub login for more than one user.** If filepass ever serves other
+  people, users sign in with GitHub's device flow, an allowlist of GitHub
+  accounts gates access, and agent tokens are minted under each user through
+  `POST /tokens`. Not needed while one operator owns every agent.
 - Prometheus `/metrics` on a separate localhost port.
 - Config reload on SIGHUP.
 - SQLite index if live files outgrow memory.
