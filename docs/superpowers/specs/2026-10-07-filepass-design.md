@@ -1,7 +1,7 @@
 # filepass — design
 
 Date: 2026-10-07
-Status: draft, revised after four reviews and a threat-model pass, awaiting approval
+Status: draft, revised after five reviews and a threat-model pass, awaiting approval
 License: MIT
 Repo: `daniel-butler/filepass`
 
@@ -115,14 +115,21 @@ Any other method on a matched path returns `405`. Because `/{filename}`
 matches every single-segment path, `GET /favicon.ico` returns `405`, not
 `404`.
 
-**Path decoding.** Handlers never use axum's `Path<String>` or
-`RawPathParams` extractors: both reject invalid percent-encoding with their
-own `400` before the handler runs, which would pre-empt the `401` step.
-Handlers read the raw segment from the `Uri` and decode it themselves.
+**Handlers own every response.** No extractor may reject a request, because
+a rejection skips the handler, and with it the handler's metric guard: the
+request would produce no `upload`, `revoke`, or `download` event. So:
 
-**Auth** is an `Agent` extractor in `auth.rs` that rejects with `401`. It is
-the first extractor on the upload and revoke handlers, so it runs before any
-other check.
+- Handlers never use axum's `Path` or `RawPathParams` extractors, which
+  reject invalid percent-encoding with their own `400`. Handlers read the raw
+  segment from the `Uri` and decode it themselves. On a download, an
+  undecodable segment is a step-1 `404`, and the handler still emits
+  `download`.
+- Auth is `Option<Agent>`, extracted infallibly in `auth.rs`. The upload,
+  fallback, and revoke handlers build their metric guard first, then turn a
+  missing or unknown token into `401` as their first check.
+
+The `PUT /d/{id}/{urlname}` route and the `PUT` fallback both live in
+`upload.rs` and emit `upload` with `result=bad_request` (or `unauthorized`).
 
 ### Download: `GET /d/{id}/{urlname}` (also `HEAD`)
 
@@ -171,7 +178,9 @@ curl -C - -fO https://filepass.host/d/3f9c.../build.zip   # resume
   2. State not `live`, or now past `expires_at` → `410`
   3. `Range` unsatisfiable → `416`
   4. `GET` only: client key at `max_downloads_per_ip` → `429`; server at
-     `max_concurrent_downloads` → `503`
+     `max_concurrent_downloads` → `503`. Both checks and both increments
+     happen under one lock, and a key enters the per-key table only when both
+     pass, so a flood of rejected clients never grows the table.
   5. Open the file and serve it; the file vanishing between step 2 and the
      open → `410`
 
@@ -287,11 +296,15 @@ can produce a live link to a partial file.
 
 **The commit cannot be cancelled.** Once the body is fully received, the
 handler hands the temp file and its reservation guard to a spawned task, which
-runs steps 2–3 and the index insert, and the handler awaits it. If the client
+runs steps 2–3, and the handler awaits it. If the client
 disconnects, hyper drops only the handler; the spawned task still finishes, so
 no blob is left in `files/` without its `.json` while its reservation is
 released. A file committed after its uploader disconnected simply expires
 unused.
+
+The `upload` metric guard moves into the commit task with the reservation, so
+the event reflects what was stored: a committed file emits `ok`, with
+`upload_bytes` and `upload_duration_ms`, even if the client has gone.
 
 ### Index states and ending a file
 
@@ -331,7 +344,7 @@ an RAII guard whose `Drop` releases it. A client disconnect drops the handler
 future, and only `Drop` runs then, so explicit release calls are not enough.
 
 - Upload guards live in the handler and drop on every exit: success, `4xx`,
-  `5xx`, timeout, or disconnect. A rejection at step 5 or 6 releases the
+  `5xx`, timeout, or disconnect. A rejection at steps 4–6 releases the
   step-3 concurrency guard. The reservation guard moves into the commit task
   once the body is complete.
 - The temp-file guard belongs to `store.rs`; its `Drop` deletes the temp file
@@ -392,6 +405,8 @@ file can stay live 24h and then remain a tombstone 48h, so at most
 `upload_rate × 60 × 72` (259,200) per agent at the defaults. Realistic use
 stays far below that. `max_tombstones` (200,000) caps them server-wide: when
 exceeded, the sweeper deletes the oldest, and those ids return `404` early.
+Each eviction pass emits `tombstones_evicted` with the count and logs a
+warning, since it means links are dying sooner than promised.
 
 ### Space protection
 
@@ -429,8 +444,9 @@ How filepass enforces the limits:
 
 ## Abuse protection
 
-filepass faces the internet, so it enforces its own limits rather than relying
-on a firewall or fail2ban.
+filepass faces the internet, so it bounds its own load: concurrency caps and
+an upload rate. Throttling raw request floods is left to the reverse proxy
+(for example nginx `limit_req`) if an operator wants it.
 
 **What keeps strangers out is the upload token.** Without one, nothing can be
 stored. Tokens carry 256 bits and link ids 128 bits, so guessing either is
@@ -442,15 +458,15 @@ below bound load instead.
 
 filepass trusts forwarding headers only from `trusted_proxies` (default
 `127.0.0.1` and `::1`). Entries are CIDRs or bare addresses; a bare address
-means /32 or /128. `ipnet` rejects bare addresses, so the parser falls back
-to `IpAddr` and converts with `IpNet::from`. filepass normalises IPv4-mapped IPv6 addresses with
+means /32 or /128. filepass normalises IPv4-mapped IPv6 addresses with
 `to_canonical()` before every match and before keying. When the socket peer is a trusted proxy, the client IP
 is the rightmost `X-Forwarded-For` entry that is not itself a trusted proxy.
 Otherwise the client IP is the socket peer, and filepass ignores any
 `X-Forwarded-For` the client sent. The proxy must overwrite the header, not
 append a client-supplied one (see Deployment).
 
-The client key — the IPv6 /64 prefix, since one host commonly controls a
+Every "per IP" limit and label in this spec means per client key. The client
+key — the IPv6 /64 prefix, since one host commonly controls a
 whole /64, or the full IPv4 address — drives `max_downloads_per_ip` and
 appears in logs. A per-key download counter exists only while that key has
 downloads in progress, so the table never grows beyond
@@ -460,8 +476,8 @@ downloads in progress, so the table never grows beyond
 
 Each agent has a token bucket of capacity `upload_rate` (60), refilling at
 `upload_rate` per minute. Uploads rejected before step 4 of the check order
-spend nothing; every upload that reaches step 4 spends one token, even if it
-later fails with `413`, `507`, or `408`. The rate caps how hard a leaked token can hit the server and bounds
+spend nothing; every upload that reaches step 4 spends one token, however it
+ends. The rate caps how hard a leaked token can hit the server and bounds
 tombstone growth.
 
 ### Concurrency
@@ -577,6 +593,7 @@ changes.
 | `expired_undownloaded` | counter | `agent` | sweeper expires a file never downloaded |
 | `revoke` | counter | `agent`, `result` | each DELETE |
 | `throttled` | counter | `reason` | each `429` or `503` from a limiter |
+| `tombstones_evicted` | counter | — | each sweep that evicts tombstones over `max_tombstones` |
 | `stored_bytes` | gauge | `agent`, plus `total` | each sweep |
 | `live_files` | gauge | — | each sweep |
 | `tombstones` | gauge | — | each sweep |
@@ -590,7 +607,7 @@ still produces exactly one event, with `result=client_aborted`.
 `upload_rate`, `uploads_per_agent`, `uploads_total`,
 `downloads_per_ip`, `downloads_total`.
 
-Every `GET /d/...` emits `download` exactly once: rejected requests when they are
+Every `GET` routed to `/d/{id}/{urlname}` emits `download` exactly once: rejected requests when they are
 rejected, served requests from the producer task's guard when the transfer
 ends (`ok`, `client_aborted`, `revoked`, `timeout`, or `error`). `HEAD`
 requests emit nothing.
@@ -660,7 +677,7 @@ reads those logs.
 | `client_ip.rs` | Trusted-proxy resolution and IPv6 /64 keying |
 | `names.rs` | Filename validation and URL-safe name derivation |
 | `store.rs` | Blob and metadata files, index and its states, reservations, recovery |
-| `upload.rs` | PUT handler and fallback: check order, streaming, hashing, limits, timeouts, commit task |
+| `upload.rs` | PUT handler, `PUT` fallback, and `PUT /d/...` rejection: check order, streaming, hashing, limits, timeouts, commit task |
 | `download.rs` | GET, HEAD, and DELETE handlers; range serving; cancellation |
 | `limits.rs` | Upload rate, concurrency caps, and their guards |
 | `sweeper.rs` | Expiry, tombstone removal, gauge emission; `run_once()` for tests |
@@ -780,6 +797,13 @@ Integration tests start the real server on a random port with a temp
   bare-address `trusted_proxies` entries parse; IPv4-mapped addresses match
   their IPv4 form.
 - The per-key download table empties when downloads finish.
+- `Retry-After`: the time until the next token on an upload-rate `429`, and
+  `1` on every concurrency `429`/`503`; each limiter emits `throttled` with
+  its own `reason`.
+- `401` on upload and revoke, and `400` from the fallback, each emit their
+  metric event.
+- A client that disconnects after its body arrives yields `upload result=ok`
+  once the commit lands.
 - Upload rate: `429` once the bucket empties; requests rejected before step 4
   spend nothing.
 - Tombstones beyond `max_tombstones` are evicted oldest first.
