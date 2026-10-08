@@ -31,7 +31,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
 clap = { version = "4", features = ["derive"] }
 ipnet = "2"
-nix = { version = "0.31", features = ["fs"] }
+nix = { version = "0.31", features = ["fs", "user"] }
 thiserror = "2"
 
 [dev-dependencies]
