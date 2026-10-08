@@ -121,3 +121,55 @@ fn serve_refuses_bad_data_dir_mode() {
         "a data_dir with mode 0755 must not start the server"
     );
 }
+
+#[test]
+fn serve_names_a_missing_data_dir() {
+    let config_dir = private_tempdir();
+    let data_dir = config_dir.path().join("never-created");
+    let config_path = config_dir.path().join("filepass.toml");
+    fs::write(
+        &config_path,
+        format!(
+            r#"
+                listen     = "127.0.0.1:0"
+                public_url = "http://localhost"
+                data_dir   = "{}"
+            "#,
+            data_dir.display()
+        ),
+    )
+    .expect("write config");
+
+    let output = filepass()
+        .args([
+            "serve",
+            "--config",
+            config_path.to_str().expect("utf8 path"),
+        ])
+        .output()
+        .expect("run filepass serve");
+
+    assert!(
+        !output.status.success(),
+        "a missing data_dir must not start the server"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains(&data_dir.display().to_string()),
+        "stderr must name the missing data_dir; stderr was {stderr:?}"
+    );
+}
+
+#[test]
+fn version_flag_prints_the_crate_version() {
+    let output = filepass()
+        .arg("--version")
+        .output()
+        .expect("run filepass --version");
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).expect("stdout is UTF-8");
+    assert_eq!(
+        stdout.trim(),
+        format!("filepass {}", env!("CARGO_PKG_VERSION"))
+    );
+}

@@ -282,7 +282,10 @@ mod tests {
             .expect("parses")
     }
 
+    /// Opens a second store on `h`'s `data_dir`, as a restart would. The
+    /// harness's own store gives up `data_dir/lock` first.
     fn reopen(h: &Harness) -> (Store, RecoveryReport) {
+        h.store.unlock_data_dir();
         Store::open(&h.cfg, h.clock.clone()).expect("reopen")
     }
 
@@ -518,6 +521,7 @@ mod tests {
         let stray = files(&h).join(format!("{id}.bak"));
         fs::write(&stray, b"x").expect("stray");
         fs::set_permissions(files(&h), fs::Permissions::from_mode(0o500)).expect("chmod");
+        h.store.unlock_data_dir();
         let result = Store::open(&h.cfg, h.clock.clone());
         fs::set_permissions(files(&h), fs::Permissions::from_mode(0o700)).expect("chmod back");
         let err = result.expect_err("recovery must fail");

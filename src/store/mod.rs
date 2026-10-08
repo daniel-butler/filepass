@@ -4,6 +4,7 @@
 //! Layout under `data_dir` (all directories `0700`, all files `0600`):
 //!
 //! ```text
+//! lock              held (flock) for the store's lifetime: one instance per dir
 //! tmp/              uploads and metadata writes in progress; emptied at startup
 //! files/{id}        file contents
 //! files/{id}.json   metadata (`Meta`)
@@ -38,6 +39,7 @@ mod recover;
 pub use end::{ExpiredFile, RevokeOutcome, SweepReport};
 
 use std::collections::{BTreeMap, HashMap};
+use std::fs::{File, OpenOptions, TryLockError};
 use std::io;
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
@@ -149,6 +151,15 @@ fn whole_seconds(t: SystemTime) -> SystemTime {
 pub enum StoreError {
     #[error("{0} must be owned by the current user with mode 0700")]
     Permissions(PathBuf),
+    /// `data_dir` (or a directory or the lock file inside it) could not be
+    /// read or created: most often it does not exist yet.
+    #[error("data_dir {}: {source}", .path.display())]
+    DataDir { path: PathBuf, source: io::Error },
+    /// Another process holds `data_dir/lock`: a second filepass on the
+    /// same `data_dir` would empty the first one's `tmp/` and race its
+    /// index.
+    #[error("{} is held by another filepass process; refusing to start", .0.display())]
+    Locked(PathBuf),
     /// Startup recovery could not write or unlink this path; the store
     /// refuses to open. The message shortens the file name so it never
     /// shows a full file id.
@@ -397,6 +408,9 @@ pub struct Store {
     tmp_dir: PathBuf,
     files_dir: PathBuf,
     index: Mutex<Index>,
+    /// `data_dir/lock`, exclusively locked for as long as the store lives;
+    /// closing it on drop releases the lock.
+    _lock: File,
     /// Test hook: replaces `statvfs` with fixed `(free bytes, free inodes)`.
     fs_override: Mutex<Option<(u64, u64)>>,
     /// Test hook: makes every metadata write fail.
@@ -405,20 +419,46 @@ pub struct Store {
 
 impl Store {
     /// Opens the store at `cfg.data_dir`: checks that it is owned by the
-    /// current user with mode `0700`, creates `tmp/` and `files/`, and runs
-    /// startup recovery.
+    /// current user with mode `0700`, takes the exclusive `data_dir/lock`
+    /// (refusing to open if another process holds it), creates `tmp/` and
+    /// `files/`, and runs startup recovery.
     pub fn open(
         cfg: &Config,
         clock: Arc<dyn Clock>,
     ) -> Result<(Store, RecoveryReport), StoreError> {
         let data_dir = &cfg.data_dir;
-        if !disk::is_private_dir(data_dir)? {
+        let at = |path: &Path| {
+            let path = path.to_path_buf();
+            move |source| StoreError::DataDir { path, source }
+        };
+        if !disk::is_private_dir(data_dir).map_err(at(data_dir))? {
             return Err(StoreError::Permissions(data_dir.clone()));
+        }
+        // Lock before recovery touches anything: recovery empties `tmp/`,
+        // which would destroy a running instance's uploads in progress.
+        let lock_path = data_dir.join("lock");
+        let lock = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .mode(0o600)
+            .open(&lock_path)
+            .map_err(at(&lock_path))?;
+        match lock.try_lock() {
+            Ok(()) => {}
+            Err(TryLockError::WouldBlock) => return Err(StoreError::Locked(lock_path)),
+            Err(TryLockError::Error(source)) => {
+                return Err(StoreError::DataDir {
+                    path: lock_path,
+                    source,
+                })
+            }
         }
         let tmp_dir = data_dir.join("tmp");
         let files_dir = data_dir.join("files");
         for dir in [&tmp_dir, &files_dir] {
-            create_private_dir(dir)?;
+            create_private_dir(dir).map_err(at(dir))?;
         }
         let store = Store {
             cfg: cfg.clone(),
@@ -426,6 +466,7 @@ impl Store {
             tmp_dir,
             files_dir,
             index: Mutex::new(Index::default()),
+            _lock: lock,
             fs_override: Mutex::new(None),
             fail_meta_writes: AtomicBool::new(false),
         };
@@ -721,6 +762,14 @@ impl Store {
         self.fail_meta_writes.store(on, Ordering::SeqCst);
     }
 
+    /// Test hook: releases `data_dir/lock` early, so a unit test can reopen
+    /// the same `data_dir` (to exercise recovery) while this store is still
+    /// alive.
+    #[cfg(test)]
+    pub(crate) fn unlock_data_dir(&self) {
+        self._lock.unlock().expect("unlock data_dir/lock");
+    }
+
     #[doc(hidden)]
     pub fn reserved_bytes(&self) -> u64 {
         self.index().reserved_bytes
@@ -1008,7 +1057,61 @@ mod tests {
         }
         fs::write(h.dir.path().join("tmp").join("junk"), b"x").expect("write junk");
         let cfg = Config::for_tests(h.dir.path().to_path_buf());
+        h.store.unlock_data_dir();
         let (_store, _report) = Store::open(&cfg, h.clock.clone()).expect("reopen");
+        assert!(dir_entries(&h.dir.path().join("tmp")).is_empty());
+    }
+
+    #[test]
+    fn open_names_a_missing_data_dir() {
+        let parent = TempDir::new().expect("tempdir");
+        let missing = parent.path().join("not-created");
+        let cfg = Config::for_tests(missing.clone());
+        let clock = Arc::new(TestClock::new(UNIX_EPOCH));
+        let err = Store::open(&cfg, clock).map(|_| ()).expect_err("must fail");
+        assert!(
+            err.to_string().contains(&missing.display().to_string()),
+            "error must name the data_dir: {err}"
+        );
+        match err {
+            StoreError::DataDir { path, source } => {
+                assert_eq!(path, missing);
+                assert_eq!(source.kind(), io::ErrorKind::NotFound);
+            }
+            other => panic!("expected DataDir error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn second_open_on_same_dir_refuses_and_leaves_tmp_alone() {
+        let h = harness(|_| {});
+        let junk = h.dir.path().join("tmp").join("upload-in-progress");
+        fs::write(&junk, b"x").expect("write junk");
+
+        let err = Store::open(&h.cfg, h.clock.clone())
+            .map(|_| ())
+            .expect_err("a second store on a locked data_dir must not open");
+        let lock_path = h.dir.path().join("lock");
+        assert!(
+            err.to_string().contains(&lock_path.display().to_string()),
+            "error must name the lock file: {err}"
+        );
+        assert!(
+            matches!(&err, StoreError::Locked(p) if *p == lock_path),
+            "expected Locked error, got {err:?}"
+        );
+        assert_eq!(
+            fs::read(&junk).expect("tmp entry survives"),
+            b"x",
+            "a refused open must not run recovery"
+        );
+
+        // Once the first store is gone, the lock is free again, and
+        // recovery leaves the lock file (outside `tmp/` and `files/`) alone.
+        drop(h.store);
+        let (_store, report) = Store::open(&h.cfg, h.clock.clone()).expect("open after drop");
+        assert!(report.warnings.is_empty(), "{:?}", report.warnings);
+        assert!(lock_path.exists(), "recovery must not touch data_dir/lock");
         assert!(dir_entries(&h.dir.path().join("tmp")).is_empty());
     }
 

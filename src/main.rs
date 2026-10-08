@@ -1,6 +1,7 @@
 //! The `filepass` binary: `serve` (load config, start the server, shut
 //! down gracefully) and `token` (mint a new agent credential).
 
+use std::io::IsTerminal;
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::Arc;
@@ -17,7 +18,11 @@ use filepass::obs::Obs;
 use filepass::sweeper::Sweeper;
 
 #[derive(Parser)]
-#[command(name = "filepass", about = "A small file-drop server for agents")]
+#[command(
+    name = "filepass",
+    version,
+    about = "A small file-drop server for agents"
+)]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -88,6 +93,8 @@ async fn run_serve(config_path: PathBuf) -> ExitCode {
     };
 
     Sweeper::new(state.clone()).spawn();
+    let addr = listener.local_addr().unwrap_or(listen);
+    tracing::info!("listening on {addr}");
 
     match app::serve(listener, state, shutdown_signal()).await {
         Ok(()) => ExitCode::SUCCESS,
@@ -111,7 +118,12 @@ fn init_tracing(log_format: LogFormat) {
                 .init();
         }
         LogFormat::Text => {
-            tracing_subscriber::fmt().with_env_filter(filter).init();
+            // No colour codes unless stdout is a terminal: under systemd it
+            // is journald, which would store the escapes verbatim.
+            tracing_subscriber::fmt()
+                .with_env_filter(filter)
+                .with_ansi(std::io::stdout().is_terminal())
+                .init();
         }
     }
 }

@@ -195,11 +195,25 @@ fn validate_public_url(raw: &str) -> Result<String, String> {
     }
 }
 
+/// The longest duration any key accepts: 100 years (humantime's `100y`,
+/// years of 365.25 days). Far beyond any sane setting, and far enough
+/// below the overflow limits of `Instant` and `SystemTime` arithmetic
+/// (`now + max_ttl`, `started + max_download_duration`) that adding one to
+/// the current time can never panic.
+pub const MAX_DURATION: Duration = Duration::from_secs(100 * 31_557_600);
+
 fn parse_duration_field(key: &'static str, raw: &str) -> Result<Duration, ConfigError> {
-    humantime::parse_duration(raw).map_err(|e| ConfigError::Invalid {
+    let d = humantime::parse_duration(raw).map_err(|e| ConfigError::Invalid {
         key,
         reason: e.to_string(),
-    })
+    })?;
+    if d > MAX_DURATION {
+        return Err(ConfigError::Invalid {
+            key,
+            reason: format!("`{raw}` is longer than the 100-year maximum"),
+        });
+    }
+    Ok(d)
 }
 
 fn parse_size_field(key: &'static str, raw: &str) -> Result<u64, ConfigError> {
@@ -337,7 +351,11 @@ impl Config {
         )?;
         let min_free_inodes = raw.min_free_inodes.unwrap_or(10_000) as usize;
 
-        let upload_rate = raw.upload_rate.unwrap_or(60) as u32;
+        let upload_rate =
+            u32::try_from(raw.upload_rate.unwrap_or(60)).map_err(|_| ConfigError::Invalid {
+                key: "upload_rate",
+                reason: format!("must be at most {}", u32::MAX),
+            })?;
         let max_concurrent_uploads = raw.max_concurrent_uploads.unwrap_or(32) as usize;
         let max_uploads_per_agent = raw.max_uploads_per_agent.unwrap_or(8) as usize;
         let max_concurrent_downloads = raw.max_concurrent_downloads.unwrap_or(64) as usize;
@@ -545,6 +563,43 @@ mod tests {
 
         let toml = base_toml(r#"tombstone_ttl = "0s""#);
         assert!(Config::from_toml_str(&toml).is_err());
+    }
+
+    #[test]
+    fn rejects_durations_over_100_years() {
+        let keys = [
+            "default_ttl",
+            "max_ttl",
+            "tombstone_ttl",
+            "upload_idle_timeout",
+            "max_upload_duration",
+            "download_idle_timeout",
+            "max_download_duration",
+            "shutdown_grace",
+        ];
+        for key in keys {
+            let toml = base_toml(&format!(r#"{key} = "101y""#));
+            match Config::from_toml_str(&toml) {
+                Err(ConfigError::Invalid { key: k, .. }) => assert_eq!(k, key),
+                other => panic!("{key} = 101y: expected Invalid, got {other:?}"),
+            }
+        }
+        // The cap itself is allowed (on `max_ttl`, so `default_ttl` stays
+        // below it).
+        let cfg = Config::from_toml_str(&base_toml(r#"max_ttl = "100y""#)).expect("100y is ok");
+        assert_eq!(cfg.max_ttl, MAX_DURATION);
+    }
+
+    #[test]
+    fn rejects_upload_rate_beyond_u32() {
+        let toml = base_toml(&format!("upload_rate = {}", u64::from(u32::MAX) + 1));
+        match Config::from_toml_str(&toml) {
+            Err(ConfigError::Invalid { key, .. }) => assert_eq!(key, "upload_rate"),
+            other => panic!("expected Invalid upload_rate, got {other:?}"),
+        }
+        let toml = base_toml(&format!("upload_rate = {}", u32::MAX));
+        let cfg = Config::from_toml_str(&toml).expect("u32::MAX is a valid rate");
+        assert_eq!(cfg.upload_rate, u32::MAX);
     }
 
     #[test]
