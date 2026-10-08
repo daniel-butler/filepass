@@ -24,7 +24,11 @@
 //! the raw `Uri` and uses only infallible extractors, so every `GET`
 //! emits exactly one `download` event.
 //!
-//! `delete` is a stub until Task 10 implements revocation.
+//! `delete` revokes a file on behalf of its uploader, in the spec's Revoke
+//! check order: token (`401`); id and name (`404`); uploader (`403`);
+//! state (`410`); otherwise `204` and the file is ended via
+//! `Store::revoke`. Like `get`, it reads `id` and `urlname` from the raw
+//! `Uri`, so every `DELETE` emits exactly one `revoke` event.
 
 use std::io::{self, SeekFrom};
 use std::time::Duration;
@@ -44,12 +48,13 @@ use tokio::time::{sleep_until, timeout, Instant};
 use tokio_util::sync::{CancellationToken, DropGuard};
 
 use crate::app::AppState;
+use crate::auth::MaybeAgent;
 use crate::client_ip::ClientAddr;
 use crate::limits::DownloadSlot;
 use crate::names;
 use crate::obs::{Obs, Outcome};
 use crate::range::{self, RangeDecision};
-use crate::store::{LiveFile, Lookup};
+use crate::store::{LiveFile, Lookup, RevokeOutcome};
 
 /// Bytes per read, and per chunk sent to the response body.
 const CHUNK_SIZE: usize = 256 * 1024;
@@ -369,7 +374,72 @@ pub async fn get(
     (span.status, response_headers, body).into_response()
 }
 
-/// `DELETE /d/{id}/{urlname}`: stub. Task 10 implements revocation.
-pub async fn delete(State(_state): State<AppState>) -> impl IntoResponse {
-    StatusCode::NOT_IMPLEMENTED
+/// Emits exactly one `revoke` event when dropped: `agent` (`-` when no
+/// valid token was presented) and `result` per the spec's result table.
+/// Its outcome starts as `ClientAborted`, the same convention as
+/// `DownloadMetric` and `upload`'s `UploadMetric`, so a disconnect before
+/// the response is ready still emits one event.
+struct RevokeMetric {
+    obs: Obs,
+    agent: Option<String>,
+    outcome: Outcome,
+}
+
+impl RevokeMetric {
+    fn new(obs: Obs, agent: Option<String>) -> RevokeMetric {
+        RevokeMetric {
+            obs,
+            agent,
+            outcome: Outcome::ClientAborted,
+        }
+    }
+}
+
+impl Drop for RevokeMetric {
+    fn drop(&mut self) {
+        self.obs.counter(
+            "revoke",
+            &[
+                ("agent", self.agent.as_deref().unwrap_or("-")),
+                ("result", self.outcome.as_str()),
+            ],
+            1,
+        );
+    }
+}
+
+/// Records `outcome` on `metric` and answers the bare `status`.
+fn finish(metric: &mut RevokeMetric, status: StatusCode, outcome: Outcome) -> Response {
+    metric.outcome = outcome;
+    status.into_response()
+}
+
+/// `DELETE /d/{id}/{urlname}`: revokes a file, evaluated in the spec's
+/// check order. The `revoke` metric guard is built first, so every exit
+/// emits exactly one `revoke` event.
+pub async fn delete(
+    State(state): State<AppState>,
+    MaybeAgent(agent): MaybeAgent,
+    uri: Uri,
+) -> Response {
+    let mut metric = RevokeMetric::new(state.obs.clone(), agent.as_ref().map(|a| a.name.clone()));
+
+    // Step 1: token.
+    let Some(agent) = agent else {
+        return finish(&mut metric, StatusCode::UNAUTHORIZED, Outcome::Unauthorized);
+    };
+
+    // Steps 2-4 (id and name, uploader, state) all run inside
+    // `Store::revoke`, in that order.
+    let Some((id, urlname)) = segments(uri.path()) else {
+        return finish(&mut metric, StatusCode::NOT_FOUND, Outcome::NotFound);
+    };
+    let (status, outcome) = match state.store.revoke(id, urlname, &agent.name).await {
+        RevokeOutcome::NotFound => (StatusCode::NOT_FOUND, Outcome::NotFound),
+        RevokeOutcome::Forbidden => (StatusCode::FORBIDDEN, Outcome::Forbidden),
+        RevokeOutcome::Gone => (StatusCode::GONE, Outcome::Gone),
+        RevokeOutcome::Revoked => (StatusCode::NO_CONTENT, Outcome::Ok),
+        RevokeOutcome::Failed => (StatusCode::INTERNAL_SERVER_ERROR, Outcome::Error),
+    };
+    finish(&mut metric, status, outcome)
 }
