@@ -29,11 +29,17 @@ pub struct Throttle {
 }
 
 impl Throttle {
-    /// Emits `throttled{reason}` and answers the status with `Retry-After`,
-    /// which every `429` and `503` carries. The caller records `outcome`
-    /// on its own `upload` or `download` metric.
+    /// Emits `throttled{reason}`, its paired readable log line, and answers
+    /// the status with `Retry-After`, which every `429` and `503` carries.
+    /// The caller records `outcome` on its own `upload` or `download`
+    /// metric.
     pub fn respond(&self, obs: &Obs) -> Response {
         obs.counter("throttled", &[("reason", self.reason)], 1);
+        tracing::info!(
+            reason = self.reason,
+            status = self.status.as_u16(),
+            "request throttled"
+        );
         (
             self.status,
             [(RETRY_AFTER, self.retry_after_secs.to_string())],
@@ -413,6 +419,64 @@ mod tests {
         assert_eq!(
             events[0].labels,
             vec![("reason", "downloads_total".to_string())]
+        );
+    }
+
+    #[test]
+    fn throttle_respond_logs_reason() {
+        use std::io::{self, Write};
+
+        /// A `Write` that appends to a shared buffer, so this test can
+        /// inspect what `tracing` formatted without touching the process's
+        /// global subscriber (there isn't one in `cargo test --lib`, and
+        /// this must stay safe to run alongside every other test in this
+        /// binary regardless).
+        #[derive(Clone)]
+        struct CapturingWriter(Arc<Mutex<Vec<u8>>>);
+
+        impl Write for CapturingWriter {
+            fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+                self.0
+                    .lock()
+                    .expect("log buffer mutex poisoned")
+                    .extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let buf = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let writer_buf = buf.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(move || CapturingWriter(writer_buf.clone()))
+            .with_ansi(false)
+            .finish();
+
+        let (obs, _recorder) = Obs::recording();
+        let throttle = Throttle {
+            status: StatusCode::TOO_MANY_REQUESTS,
+            outcome: Outcome::RateLimited,
+            reason: "upload_rate",
+            retry_after_secs: 3,
+        };
+
+        // A per-thread default, not the process-wide global one: scoped to
+        // this closure, so it cannot race with any other test.
+        tracing::subscriber::with_default(subscriber, || {
+            throttle.respond(&obs);
+        });
+
+        let captured = String::from_utf8(buf.lock().expect("log buffer mutex poisoned").clone())
+            .expect("captured log is UTF-8");
+        assert!(
+            captured.contains("upload_rate"),
+            "expected the throttle's reason in its log line; captured: {captured:?}"
+        );
+        assert!(
+            captured.contains("request throttled"),
+            "expected a readable log line paired with the counter; captured: {captured:?}"
         );
     }
 

@@ -1,9 +1,9 @@
 //! Log hygiene: the spec's Log hygiene section. Installs its own global
 //! `tracing` subscriber (safe because every file directly under `tests/`
 //! is already its own test binary) capturing at `trace` level into a
-//! shared buffer, then drives upload, download, a bad-token upload,
-//! revoke, a wrong-name GET, and a server error through the real app, and
-//! inspects everything that got logged.
+//! shared buffer, then drives upload, a throttled upload, download, a
+//! bad-token upload, revoke, a wrong-name GET, and a server error through
+//! the real app, and inspects everything that got logged.
 //!
 //! The route *template* the request span records (e.g.
 //! `/d/{id}/{urlname}`, per `app::request_span`) is expected to appear: it
@@ -62,7 +62,9 @@ async fn logs_never_leak_secrets_or_real_uris() {
         .with_env_filter(EnvFilter::new("trace"))
         .init();
 
-    let server = TestServer::start().await;
+    // `upload_rate = 1` makes the second upload below throttled
+    // deterministically, with no need to race the token bucket's refill.
+    let server = TestServer::start_with(|cfg| cfg.upload_rate = 1).await;
     let planner_token = server.token("planner").to_string();
 
     // Upload, then download: both are handled requests that log a line.
@@ -79,6 +81,13 @@ async fn logs_never_leak_secrets_or_real_uris() {
     let rest = url.split("/d/").nth(1).expect("download URL has /d/");
     let (id, _urlname) = rest.split_once('/').expect("id/urlname");
     let full_id = id.to_string();
+
+    // A throttled upload: the bucket has no token left, so this logs
+    // `Throttle::respond`'s paired reason line, not just the counter.
+    let resp = server
+        .put("/second.txt", b"y".to_vec(), Some("planner"), None)
+        .await;
+    assert_eq!(resp.status(), 429);
 
     let resp = server.get(&url).await;
     assert_eq!(resp.status(), 200);
@@ -141,5 +150,12 @@ async fn logs_never_leak_secrets_or_real_uris() {
     assert!(
         captured.contains("secret-report.txt"),
         "expected the original filename in the logs; captured:\n{captured}"
+    );
+    // `Throttle::respond`'s readable log line, paired with its `throttled`
+    // counter: the reason must be visible even though nothing else about
+    // the throttled request is.
+    assert!(
+        captured.contains("upload_rate"),
+        "expected the throttle's reason in the logs; captured:\n{captured}"
     );
 }
