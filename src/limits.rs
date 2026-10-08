@@ -10,11 +10,13 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
+use axum::http::header::RETRY_AFTER;
 use axum::http::StatusCode;
+use axum::response::{IntoResponse, Response};
 
 use crate::client_ip::ClientKey;
 use crate::config::Config;
-use crate::obs::Outcome;
+use crate::obs::{Obs, Outcome};
 
 /// A rejection from a limiter: the status and `Retry-After` to send, and
 /// the metric outcome and `throttled` reason to record.
@@ -24,6 +26,20 @@ pub struct Throttle {
     pub outcome: Outcome,
     pub reason: &'static str,
     pub retry_after_secs: u64,
+}
+
+impl Throttle {
+    /// Emits `throttled{reason}` and answers the status with `Retry-After`,
+    /// which every `429` and `503` carries. The caller records `outcome`
+    /// on its own `upload` or `download` metric.
+    pub fn respond(&self, obs: &Obs) -> Response {
+        obs.counter("throttled", &[("reason", self.reason)], 1);
+        (
+            self.status,
+            [(RETRY_AFTER, self.retry_after_secs.to_string())],
+        )
+            .into_response()
+    }
 }
 
 /// A per-agent token bucket for the upload rate limit: capacity
@@ -372,6 +388,32 @@ mod tests {
         }
 
         assert_eq!(limits.download_keys(), 1);
+    }
+
+    #[test]
+    fn throttle_respond_sets_retry_after_and_emits_throttled() {
+        let (obs, recorder) = Obs::recording();
+        let throttle = Throttle {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            outcome: Outcome::Busy,
+            reason: "downloads_total",
+            retry_after_secs: 1,
+        };
+        let resp = throttle.respond(&obs);
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            resp.headers()
+                .get(RETRY_AFTER)
+                .and_then(|v| v.to_str().ok()),
+            Some("1")
+        );
+        let events = recorder.events();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].name, "throttled");
+        assert_eq!(
+            events[0].labels,
+            vec![("reason", "downloads_total".to_string())]
+        );
     }
 
     #[test]

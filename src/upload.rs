@@ -23,7 +23,7 @@ use std::time::Duration;
 
 use axum::body::Body;
 use axum::extract::State;
-use axum::http::header::{CONTENT_LENGTH, LOCATION, RETRY_AFTER};
+use axum::http::header::{CONTENT_LENGTH, LOCATION};
 use axum::http::{HeaderMap, HeaderName, Method, StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
 use futures_util::StreamExt;
@@ -35,7 +35,7 @@ use crate::app::AppState;
 use crate::auth::{Agent, MaybeAgent};
 use crate::client_ip::ClientAddr;
 use crate::config::Config;
-use crate::limits::{Throttle, UploadSlot};
+use crate::limits::UploadSlot;
 use crate::names;
 use crate::obs::{Obs, Outcome};
 use crate::store::{self, Meta, NewFile, Reservation, ReserveError, Store, TempFile};
@@ -109,18 +109,6 @@ type Failure = (StatusCode, Outcome);
 fn fail(metric: &mut UploadMetric, (status, outcome): Failure) -> Response {
     metric.outcome = outcome;
     status.into_response()
-}
-
-/// A limiter's rejection: records `throttled{reason}` and the outcome, and
-/// answers the status with `Retry-After`.
-fn throttled(obs: &Obs, metric: &mut UploadMetric, throttle: Throttle) -> Response {
-    obs.counter("throttled", &[("reason", throttle.reason)], 1);
-    metric.outcome = throttle.outcome;
-    (
-        throttle.status,
-        [(RETRY_AFTER, throttle.retry_after_secs.to_string())],
-    )
-        .into_response()
 }
 
 /// The status and `result` for a reservation that cannot be made or grown.
@@ -306,12 +294,16 @@ pub async fn put(
     // Step 3: concurrency.
     let slot = match state.limits.try_upload(&agent.name) {
         Ok(slot) => slot,
-        Err(throttle) => return throttled(&state.obs, &mut metric, throttle),
+        Err(throttle) => {
+            metric.outcome = throttle.outcome;
+            return throttle.respond(&state.obs);
+        }
     };
 
     // Step 4: upload rate. Only requests that get this far spend a token.
     if let Err(throttle) = state.limits.try_rate(&agent.name) {
-        return throttled(&state.obs, &mut metric, throttle);
+        metric.outcome = throttle.outcome;
+        return throttle.respond(&state.obs);
     }
 
     // Steps 5-6: size and space. A declared length is reserved up front.

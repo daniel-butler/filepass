@@ -33,7 +33,7 @@ use axum::body::{Body, Bytes};
 use axum::extract::State;
 use axum::http::header::{
     CACHE_CONTROL, CONTENT_DISPOSITION, CONTENT_LENGTH, CONTENT_RANGE, CONTENT_TYPE, RANGE,
-    REFERRER_POLICY, RETRY_AFTER, X_CONTENT_TYPE_OPTIONS,
+    REFERRER_POLICY, X_CONTENT_TYPE_OPTIONS,
 };
 use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
@@ -45,7 +45,7 @@ use tokio_util::sync::{CancellationToken, DropGuard};
 
 use crate::app::AppState;
 use crate::client_ip::ClientAddr;
-use crate::limits::{DownloadSlot, Throttle};
+use crate::limits::DownloadSlot;
 use crate::names;
 use crate::obs::{Obs, Outcome};
 use crate::range::{self, RangeDecision};
@@ -101,18 +101,6 @@ impl Drop for DownloadMetric {
 fn fail(metric: &mut DownloadMetric, status: StatusCode, outcome: Outcome) -> Response {
     metric.outcome = outcome;
     status.into_response()
-}
-
-/// A limiter's rejection: records `throttled{reason}` and the outcome, and
-/// answers the status with `Retry-After`.
-fn throttled(obs: &Obs, metric: &mut DownloadMetric, throttle: Throttle) -> Response {
-    obs.counter("throttled", &[("reason", throttle.reason)], 1);
-    metric.outcome = throttle.outcome;
-    (
-        throttle.status,
-        [(RETRY_AFTER, throttle.retry_after_secs.to_string())],
-    )
-        .into_response()
 }
 
 /// The raw `id` and `urlname` segments of a `/d/{id}/{urlname}` path, or
@@ -320,7 +308,10 @@ pub async fn get(
     // Step 4: download slots.
     let slot = match state.limits.try_download(client.key) {
         Ok(slot) => slot,
-        Err(throttle) => return throttled(&state.obs, &mut metric, throttle),
+        Err(throttle) => {
+            metric.outcome = throttle.outcome;
+            return throttle.respond(&state.obs);
+        }
     };
 
     // Step 5: open the file. It may have been ended since the lookup.
