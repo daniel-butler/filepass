@@ -31,6 +31,7 @@
 //! `Uri`, so every `DELETE` emits exactly one `revoke` event.
 
 use std::io::{self, SeekFrom};
+use std::net::IpAddr;
 use std::time::Duration;
 
 use axum::body::{Body, Bytes};
@@ -52,7 +53,7 @@ use crate::auth::MaybeAgent;
 use crate::client_ip::ClientAddr;
 use crate::limits::DownloadSlot;
 use crate::names;
-use crate::obs::{Obs, Outcome};
+use crate::obs::{log_size, log_str, Obs, Outcome};
 use crate::range::{self, RangeDecision};
 use crate::store::{LiveFile, Lookup, RevokeOutcome};
 
@@ -77,15 +78,26 @@ struct DownloadMetric {
     served: bool,
     /// Bytes handed to the response body.
     bytes: u64,
+    client_ip: IpAddr,
+    /// The first 8 characters of the requested id, once the path parses.
+    id: Option<String>,
+    /// The file's uploader, once it is found.
+    agent: Option<String>,
+    /// The file's original filename, once it is found.
+    filename: Option<String>,
 }
 
 impl DownloadMetric {
-    fn new(obs: Option<Obs>) -> DownloadMetric {
+    fn new(obs: Option<Obs>, client_ip: IpAddr) -> DownloadMetric {
         DownloadMetric {
             obs,
             outcome: Outcome::ClientAborted,
             served: false,
             bytes: 0,
+            client_ip,
+            id: None,
+            agent: None,
+            filename: None,
         }
     }
 }
@@ -99,6 +111,16 @@ impl Drop for DownloadMetric {
         if self.served {
             obs.counter("download_bytes", &[], self.bytes);
         }
+        let size = self.served.then_some(self.bytes);
+        tracing::info!(
+            agent = log_str(self.agent.as_deref()),
+            id = log_str(self.id.as_deref()),
+            filename = log_str(self.filename.as_deref()),
+            size = %log_size(size),
+            client_ip = %self.client_ip,
+            result = self.outcome.as_str(),
+            "download request handled"
+        );
     }
 }
 
@@ -115,6 +137,14 @@ fn fail(metric: &mut DownloadMetric, status: StatusCode, outcome: Outcome) -> Re
 fn segments(path: &str) -> Option<(&str, &str)> {
     let (id, urlname) = path.strip_prefix("/d/")?.split_once('/')?;
     (!urlname.contains('/')).then_some((id, urlname))
+}
+
+/// The first 8 bytes of `s`, or all of it if shorter: a safe log prefix for
+/// an id that has not yet been validated as 32 hex characters. `s` is
+/// always ASCII here (a raw, still-encoded path segment from the URI), so
+/// slicing by byte count never splits a multi-byte character.
+fn short(s: &str) -> &str {
+    &s[..s.len().min(8)]
 }
 
 /// What a satisfiable request serves: the status, the first byte, and the
@@ -258,17 +288,20 @@ pub async fn get(
 ) -> Response {
     let started = Instant::now();
     let is_get = method == Method::GET;
-    let mut metric = DownloadMetric::new(is_get.then(|| state.obs.clone()));
+    let mut metric = DownloadMetric::new(is_get.then(|| state.obs.clone()), client.ip);
 
     // Steps 1-2: id, name, state, and expiry, in one lock acquisition.
     let Some((id, urlname)) = segments(uri.path()) else {
         return fail(&mut metric, StatusCode::NOT_FOUND, Outcome::NotFound);
     };
+    metric.id = Some(short(id).to_string());
     let file = match state.store.lookup(id, urlname) {
         Lookup::NotFound => return fail(&mut metric, StatusCode::NOT_FOUND, Outcome::NotFound),
         Lookup::Gone => return fail(&mut metric, StatusCode::GONE, Outcome::Gone),
         Lookup::Live(file) => file,
     };
+    metric.agent = Some(file.uploader.clone());
+    metric.filename = Some(file.name.clone());
     // `lookup` accepted `id`, so it is 32 hex characters.
     let id_prefix = &id[..8];
 
@@ -383,14 +416,25 @@ struct RevokeMetric {
     obs: Obs,
     agent: Option<String>,
     outcome: Outcome,
+    client_ip: IpAddr,
+    /// The first 8 characters of the requested id, once the path parses.
+    id: Option<String>,
+    /// The file's original filename and size, when a lookup found it live
+    /// just before the revoke.
+    filename: Option<String>,
+    size: Option<u64>,
 }
 
 impl RevokeMetric {
-    fn new(obs: Obs, agent: Option<String>) -> RevokeMetric {
+    fn new(obs: Obs, agent: Option<String>, client_ip: IpAddr) -> RevokeMetric {
         RevokeMetric {
             obs,
             agent,
             outcome: Outcome::ClientAborted,
+            client_ip,
+            id: None,
+            filename: None,
+            size: None,
         }
     }
 }
@@ -404,6 +448,15 @@ impl Drop for RevokeMetric {
                 ("result", self.outcome.as_str()),
             ],
             1,
+        );
+        tracing::info!(
+            agent = log_str(self.agent.as_deref()),
+            id = log_str(self.id.as_deref()),
+            filename = log_str(self.filename.as_deref()),
+            size = %log_size(self.size),
+            client_ip = %self.client_ip,
+            result = self.outcome.as_str(),
+            "revoke request handled"
         );
     }
 }
@@ -420,9 +473,14 @@ fn finish(metric: &mut RevokeMetric, status: StatusCode, outcome: Outcome) -> Re
 pub async fn delete(
     State(state): State<AppState>,
     MaybeAgent(agent): MaybeAgent,
+    client: ClientAddr,
     uri: Uri,
 ) -> Response {
-    let mut metric = RevokeMetric::new(state.obs.clone(), agent.as_ref().map(|a| a.name.clone()));
+    let mut metric = RevokeMetric::new(
+        state.obs.clone(),
+        agent.as_ref().map(|a| a.name.clone()),
+        client.ip,
+    );
 
     // Step 1: token.
     let Some(agent) = agent else {
@@ -434,6 +492,14 @@ pub async fn delete(
     let Some((id, urlname)) = segments(uri.path()) else {
         return finish(&mut metric, StatusCode::NOT_FOUND, Outcome::NotFound);
     };
+    metric.id = Some(short(id).to_string());
+    // Best-effort, for the log line only: `revoke` re-derives everything
+    // it needs itself, so a file ended between this lookup and that call
+    // just means the log line falls back to "-".
+    if let Lookup::Live(file) = state.store.lookup(id, urlname) {
+        metric.filename = Some(file.name.clone());
+        metric.size = Some(file.size);
+    }
     let (status, outcome) = match state.store.revoke(id, urlname, &agent.name).await {
         RevokeOutcome::NotFound => (StatusCode::NOT_FOUND, Outcome::NotFound),
         RevokeOutcome::Forbidden => (StatusCode::FORBIDDEN, Outcome::Forbidden),

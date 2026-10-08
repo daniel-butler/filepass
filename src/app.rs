@@ -11,10 +11,13 @@ use std::io;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use axum::extract::FromRef;
+use axum::extract::{FromRef, MatchedPath, Request};
+use axum::middleware::{self, Next};
+use axum::response::Response;
 use axum::routing::{get, put, Router};
 use tokio::net::TcpListener;
 use tokio::time::sleep;
+use tracing::Instrument;
 
 use crate::auth::Tokens;
 use crate::client_ip::TrustedProxies;
@@ -75,6 +78,24 @@ async fn health() -> &'static str {
     "ok"
 }
 
+/// Wraps every request in `info_span!("request", method, route)`, entered
+/// for the whole handling of the request, so every log line it produces
+/// (and, under `log_format = "json"`, every JSON line's `span` object)
+/// carries both fields. `route` is the matched route *template* from
+/// `MatchedPath` (e.g. `/d/{id}/{urlname}`), never the real path with its
+/// id and filename; a request nothing matched (the router's `fallback`)
+/// has no `MatchedPath`, so `route` is `"fallback"`.
+pub async fn request_span(req: Request, next: Next) -> Response {
+    let method = req.method().clone();
+    let route = req
+        .extensions()
+        .get::<MatchedPath>()
+        .map(|p| p.as_str().to_string())
+        .unwrap_or_else(|| "fallback".to_string());
+    let span = tracing::info_span!("request", %method, %route);
+    next.run(req).instrument(span).await
+}
+
 /// Builds the router per the spec's Routing table. axum matches the path
 /// before the method, so a method mismatch on a matched path yields its
 /// own `405` automatically; only `fallback` needs to distinguish `PUT`
@@ -90,6 +111,7 @@ pub fn router(state: AppState) -> Router {
                 .put(upload::put_bad_path),
         )
         .fallback(upload::fallback)
+        .layer(middleware::from_fn(request_span))
         .with_state(state)
 }
 

@@ -158,6 +158,17 @@ fn log_metric(
     }
 }
 
+/// A per-request log field: `v` if known, `-` if not — the same convention
+/// the metric table uses for "no agent".
+pub fn log_str(v: Option<&str>) -> &str {
+    v.unwrap_or("-")
+}
+
+/// Like `log_str`, for a size in bytes.
+pub fn log_size(v: Option<u64>) -> String {
+    v.map(|n| n.to_string()).unwrap_or_else(|| "-".to_string())
+}
+
 /// The `result` label value for a metric event, per the spec's telemetry
 /// table.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

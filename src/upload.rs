@@ -18,6 +18,7 @@
 //! `ClientAddr` never reject a request, and no handler uses axum's `Path`
 //! extractor, so no request skips its metric.
 
+use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -37,7 +38,7 @@ use crate::client_ip::ClientAddr;
 use crate::config::Config;
 use crate::limits::UploadSlot;
 use crate::names;
-use crate::obs::{Obs, Outcome};
+use crate::obs::{log_size, log_str, Obs, Outcome};
 use crate::store::{self, Meta, NewFile, Reservation, ReserveError, Store, TempFile};
 
 /// The spec's exact hint body for `PUT /`.
@@ -75,16 +76,24 @@ struct UploadMetric {
     started: Instant,
     /// Bytes stored; reported only for `Ok`.
     bytes: u64,
+    client_ip: IpAddr,
+    /// The first 8 characters of the stored file's id, once generated.
+    id: Option<String>,
+    /// The original (not URL-safe) filename, once decoded.
+    filename: Option<String>,
 }
 
 impl UploadMetric {
-    fn new(obs: Obs, agent: Option<String>) -> UploadMetric {
+    fn new(obs: Obs, agent: Option<String>, client_ip: IpAddr) -> UploadMetric {
         UploadMetric {
             obs,
             agent,
             outcome: Outcome::ClientAborted,
             started: Instant::now(),
             bytes: 0,
+            client_ip,
+            id: None,
+            filename: None,
         }
     }
 }
@@ -99,6 +108,16 @@ impl Drop for UploadMetric {
             let ms = self.started.elapsed().as_secs_f64() * 1000.0;
             self.obs.timing_ms("upload_duration_ms", &labels, ms);
         }
+        let size = (self.outcome == Outcome::Ok).then_some(self.bytes);
+        tracing::info!(
+            agent = log_str(agent),
+            id = log_str(self.id.as_deref()),
+            filename = log_str(self.filename.as_deref()),
+            size = %log_size(size),
+            client_ip = %self.client_ip,
+            result = self.outcome.as_str(),
+            "upload request handled"
+        );
     }
 }
 
@@ -266,12 +285,16 @@ fn created(public_url: &str, meta: &Meta) -> Response {
 pub async fn put(
     State(state): State<AppState>,
     MaybeAgent(agent): MaybeAgent,
-    _client: ClientAddr,
+    client: ClientAddr,
     uri: Uri,
     headers: HeaderMap,
     body: Body,
 ) -> Response {
-    let mut metric = UploadMetric::new(state.obs.clone(), agent.as_ref().map(|a| a.name.clone()));
+    let mut metric = UploadMetric::new(
+        state.obs.clone(),
+        agent.as_ref().map(|a| a.name.clone()),
+        client.ip,
+    );
 
     // Step 1: token.
     let Some(agent) = agent else {
@@ -287,6 +310,7 @@ pub async fn put(
     let Ok(name) = names::decode_filename(segment) else {
         return fail(&mut metric, BAD_REQUEST);
     };
+    metric.filename = Some(name.clone());
     let Some(ttl) = parse_ttl(&headers, &state.cfg) else {
         return fail(&mut metric, BAD_REQUEST);
     };
@@ -314,6 +338,7 @@ pub async fn put(
     };
 
     let id = store::new_id();
+    metric.id = Some(id[..8].to_string());
     let temp = match state.store.temp_file(&id) {
         Ok(temp) => temp,
         Err(e) => {
