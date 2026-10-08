@@ -47,6 +47,7 @@ use tokio::io::{AsyncReadExt, AsyncSeekExt};
 use tokio::sync::mpsc;
 use tokio::time::{sleep_until, timeout, Instant};
 use tokio_util::sync::{CancellationToken, DropGuard};
+use tracing::Instrument;
 
 use crate::app::AppState;
 use crate::auth::MaybeAgent;
@@ -185,16 +186,27 @@ fn file_headers(file: &LiveFile, span: &Span) -> Result<HeaderMap, axum::http::E
 }
 
 /// A response body that yields the producer's chunks until the channel
-/// closes, or fails as soon as `abort` fires. Failing (rather than ending)
-/// makes hyper close the connection short of `Content-Length`, and the
-/// abort takes priority over chunks still queued.
-fn body_from(rx: mpsc::Receiver<Bytes>, abort: CancellationToken) -> Body {
-    let stream = futures_util::stream::unfold(Some((rx, abort)), |state| async move {
-        let (mut rx, abort) = state?;
+/// closes, or fails as soon as `abort` fires (the producer stopped early)
+/// or `revoked` fires (the file's own cancellation token). Failing (rather
+/// than ending) makes hyper close the connection short of
+/// `Content-Length`, and both take priority over chunks still queued.
+/// Watching `revoked` here, not only in the producer, matters once the
+/// producer has queued its last chunk and returned `Ok`: up to
+/// `CHANNEL_CHUNKS` chunks may still be waiting, and a revoke must stop
+/// them too.
+fn body_from(
+    rx: mpsc::Receiver<Bytes>,
+    abort: CancellationToken,
+    revoked: CancellationToken,
+) -> Body {
+    let stream = futures_util::stream::unfold(Some((rx, abort, revoked)), |state| async move {
+        let (mut rx, abort, revoked) = state?;
+        let stopped = || Some((Err(io::Error::other("download stopped early")), None));
         tokio::select! {
             biased;
-            () = abort.cancelled() => Some((Err(io::Error::other("download stopped early")), None)),
-            chunk = rx.recv() => chunk.map(|chunk| (Ok(chunk), Some((rx, abort)))),
+            () = abort.cancelled() => stopped(),
+            () = revoked.cancelled() => stopped(),
+            chunk = rx.recv() => chunk.map(|chunk| (Ok(chunk), Some((rx, abort, revoked)))),
         }
     });
     Body::from_stream(stream)
@@ -385,11 +397,17 @@ pub async fn get(
             &[("agent", &first.uploader)],
             ms,
         );
+        tracing::info!(
+            agent = first.uploader.as_str(),
+            id = id_prefix,
+            ms,
+            "first download of file"
+        );
     }
 
     let (tx, rx) = mpsc::channel(CHANNEL_CHUNKS);
     let abort = CancellationToken::new();
-    let body = body_from(rx, abort.clone());
+    let body = body_from(rx, abort.clone(), file.cancel.clone());
     metric.served = true;
     let producer = Producer {
         file: fd,
@@ -403,7 +421,9 @@ pub async fn get(
         metric,
         _slot: slot,
     };
-    tokio::spawn(producer.run());
+    // The producer keeps the request span, so its log lines (and the
+    // metric guard's, which drops inside it) still carry the route.
+    tokio::spawn(producer.run().in_current_span());
     (span.status, response_headers, body).into_response()
 }
 
@@ -508,4 +528,55 @@ pub async fn delete(
         RevokeOutcome::Failed => (StatusCode::INTERNAL_SERVER_ERROR, Outcome::Error),
     };
     finish(&mut metric, status, outcome)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use futures_util::StreamExt;
+
+    /// Chunks the producer queued before returning `Ok` (so `abort` was
+    /// disarmed and will never fire) must still stop once the file is
+    /// revoked, rather than reaching the client.
+    #[tokio::test]
+    async fn revoke_stops_chunks_queued_after_producer_finished() {
+        let (tx, rx) = mpsc::channel(CHANNEL_CHUNKS);
+        let abort = CancellationToken::new();
+        let revoked = CancellationToken::new();
+        let body = body_from(rx, abort.clone(), revoked.clone());
+
+        // The producer queues everything, disarms `abort`, and is gone.
+        for _ in 0..CHANNEL_CHUNKS {
+            tx.send(Bytes::from_static(b"chunk")).await.expect("send");
+        }
+        drop(tx);
+        abort.drop_guard().disarm();
+
+        revoked.cancel();
+        let mut stream = body.into_data_stream();
+        let first = stream.next().await.expect("the body yields an item");
+        assert!(
+            first.is_err(),
+            "a revoked file's queued chunk reached the client"
+        );
+        assert!(stream.next().await.is_none(), "the body ends after failing");
+    }
+
+    /// Without a revoke, a finished producer's queued chunks all arrive and
+    /// the body ends cleanly.
+    #[tokio::test]
+    async fn queued_chunks_drain_without_revoke() {
+        let (tx, rx) = mpsc::channel(CHANNEL_CHUNKS);
+        let body = body_from(rx, CancellationToken::new(), CancellationToken::new());
+        for _ in 0..CHANNEL_CHUNKS {
+            tx.send(Bytes::from_static(b"chunk")).await.expect("send");
+        }
+        drop(tx);
+
+        let chunks: Vec<_> = body.into_data_stream().collect().await;
+        assert_eq!(chunks.len(), CHANNEL_CHUNKS);
+        assert!(chunks
+            .iter()
+            .all(|c| c.as_ref().is_ok_and(|b| b == "chunk")));
+    }
 }

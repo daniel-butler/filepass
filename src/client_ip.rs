@@ -7,6 +7,7 @@ use std::sync::Arc;
 
 use axum::extract::{ConnectInfo, FromRef, FromRequestParts};
 use axum::http::request::Parts;
+use axum::http::HeaderMap;
 use ipnet::IpNet;
 
 /// The shared list of trusted reverse-proxy networks, read by the
@@ -43,6 +44,19 @@ pub fn resolve(peer: IpAddr, xff: Option<&str>, trusted: &[IpNet]) -> IpAddr {
         }
     }
     peer
+}
+
+/// Every `X-Forwarded-For` header line in `headers`, in order, joined with
+/// `,` into the single list RFC 9110 says they are equivalent to; `None`
+/// when there is no such header. A line that is not visible ASCII becomes
+/// an empty entry, which `resolve` skips like any other unparseable one.
+fn forwarded_for(headers: &HeaderMap) -> Option<String> {
+    let lines: Vec<&str> = headers
+        .get_all("x-forwarded-for")
+        .iter()
+        .map(|v| v.to_str().unwrap_or(""))
+        .collect();
+    (!lines.is_empty()).then(|| lines.join(","))
 }
 
 /// A client's rate-limiting and logging key: the full IPv4 address, or the
@@ -124,11 +138,8 @@ where
             .get::<ConnectInfo<SocketAddr>>()
             .map(|ConnectInfo(addr)| addr.ip())
             .unwrap_or_else(|| IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)));
-        let xff = parts
-            .headers
-            .get("x-forwarded-for")
-            .and_then(|v| v.to_str().ok());
-        let ip = resolve(peer, xff, &trusted.0);
+        let xff = forwarded_for(&parts.headers);
+        let ip = resolve(peer, xff.as_deref(), &trusted.0);
         let key = ClientKey::from_ip(ip);
         Ok(ClientAddr { ip, key })
     }
@@ -160,6 +171,23 @@ mod tests {
 
         let resolved = resolve(peer, Some("1.2.3.4, 127.0.0.1"), &trusted_loopback());
         assert_eq!(resolved, "1.2.3.4".parse::<IpAddr>().unwrap());
+    }
+
+    #[test]
+    fn every_xff_line_counts_rightmost_last() {
+        // A proxy that appends its own header line, after one the client
+        // sent: the rightmost entry is in the last line, not the first.
+        let mut headers = HeaderMap::new();
+        headers.append("x-forwarded-for", "6.6.6.6".parse().unwrap());
+        headers.append("x-forwarded-for", "1.2.3.4, 127.0.0.1".parse().unwrap());
+        let xff = forwarded_for(&headers);
+        assert_eq!(xff.as_deref(), Some("6.6.6.6,1.2.3.4, 127.0.0.1"));
+
+        let peer: IpAddr = "127.0.0.1".parse().unwrap();
+        let resolved = resolve(peer, xff.as_deref(), &trusted_loopback());
+        assert_eq!(resolved, "1.2.3.4".parse::<IpAddr>().unwrap());
+
+        assert_eq!(forwarded_for(&HeaderMap::new()), None);
     }
 
     #[test]

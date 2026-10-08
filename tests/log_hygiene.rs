@@ -54,6 +54,14 @@ async fn put_with_token(server: &TestServer, path: &str, token: &str) -> reqwest
 
 #[tokio::test]
 async fn logs_never_leak_secrets_or_real_uris() {
+    // A process-wide global subscriber, deliberately. A thread-local
+    // `tracing::subscriber::with_default` capture is unsafe in this crate's
+    // lib tests: while only one dispatcher exists, tracing-core caches each
+    // callsite's `Interest` globally, so a sibling test running with no
+    // subscriber can cache `Interest::never` for a callsite (such as the
+    // `info!` in `Throttle::respond`) and the thread-local subscriber then
+    // never sees that event. This file is its own test binary, so a global
+    // subscriber here registers before any callsite fires.
     let buf = Arc::new(Mutex::new(Vec::<u8>::new()));
     let writer_buf = buf.clone();
     tracing_subscriber::fmt()
@@ -108,6 +116,11 @@ async fn logs_never_leak_secrets_or_real_uris() {
     let resp = server.get(&wrong_name_url).await;
     assert_eq!(resp.status(), 404);
 
+    // A `PUT /` with a valid token: the fallback's `400`, which logs a
+    // paired line even though no file was named.
+    let resp = put_with_token(&server, "/", &planner_token).await;
+    assert_eq!(resp.status(), 400);
+
     // A server error: a commit that fails to write its metadata.
     server.state.store.set_fail_meta_writes(true);
     let resp = server
@@ -157,5 +170,42 @@ async fn logs_never_leak_secrets_or_real_uris() {
     assert!(
         captured.contains("upload_rate"),
         "expected the throttle's reason in the logs; captured:\n{captured}"
+    );
+    // Lines logged from spawned tasks (the upload commit, the download
+    // producer) still carry their request span, so they name the route.
+    let has_line = |needles: &[&str]| {
+        captured
+            .lines()
+            .any(|line| needles.iter().all(|n| line.contains(n)))
+    };
+    assert!(
+        has_line(&[
+            "route=/{filename}",
+            "upload request handled",
+            "result=\"ok\""
+        ]),
+        "the commit task's log line lost its request span; captured:\n{captured}"
+    );
+    assert!(
+        has_line(&[
+            "route=/d/{id}/{urlname}",
+            "download request handled",
+            "result=\"ok\""
+        ]),
+        "the producer task's log line lost its request span; captured:\n{captured}"
+    );
+    // `time_to_first_download_ms` and the fallback's `upload` event each
+    // have a readable paired line.
+    assert!(
+        has_line(&["first download of file", &full_id[..8]]),
+        "expected a readable line paired with time_to_first_download_ms; captured:\n{captured}"
+    );
+    assert!(
+        has_line(&["upload request handled", "result=\"bad_request\""]),
+        "expected a readable line paired with the fallback's upload event; captured:\n{captured}"
+    );
+    assert!(
+        captured.contains("request throttled"),
+        "expected a readable log line paired with the throttled counter; captured:\n{captured}"
     );
 }

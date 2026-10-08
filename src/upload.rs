@@ -31,6 +31,7 @@ use futures_util::StreamExt;
 use sha2::{Digest, Sha256};
 use tokio::io::AsyncWriteExt;
 use tokio::time::{timeout_at, Instant};
+use tracing::Instrument;
 
 use crate::app::AppState;
 use crate::auth::{Agent, MaybeAgent};
@@ -360,23 +361,28 @@ pub async fn put(
     };
     let store = Arc::clone(&state.store);
     let cfg = Arc::clone(&state.cfg);
-    let task = tokio::spawn(async move {
-        // Rebind so the task owns the whole guard; assigning its `Copy`
-        // fields alone would capture only copies of them.
-        let mut metric = metric;
-        // Until the upload resolves, the guard reports an error, so a
-        // panic unwinds through it as `error`, not `client_aborted`.
-        metric.outcome = Outcome::Error;
-        let result = store_upload(&store, &cfg, upload, body).await;
-        match &result {
-            Ok(meta) => {
-                metric.outcome = Outcome::Ok;
-                metric.bytes = meta.size;
+    // The commit task keeps the request span, so its log lines (and the
+    // metric guard's, which drops inside it) still carry the route.
+    let task = tokio::spawn(
+        async move {
+            // Rebind so the task owns the whole guard; assigning its `Copy`
+            // fields alone would capture only copies of them.
+            let mut metric = metric;
+            // Until the upload resolves, the guard reports an error, so a
+            // panic unwinds through it as `error`, not `client_aborted`.
+            metric.outcome = Outcome::Error;
+            let result = store_upload(&store, &cfg, upload, body).await;
+            match &result {
+                Ok(meta) => {
+                    metric.outcome = Outcome::Ok;
+                    metric.bytes = meta.size;
+                }
+                Err((_, outcome)) => metric.outcome = *outcome,
             }
-            Err((_, outcome)) => metric.outcome = *outcome,
+            result
         }
-        result
-    });
+        .in_current_span(),
+    );
     match task.await {
         Ok(Ok(meta)) => created(&state.cfg.public_url, &meta),
         Ok(Err((status, _))) => status.into_response(),
@@ -389,20 +395,33 @@ pub async fn put(
 
 /// The shared response for a path that is final at step 1-2 of the upload
 /// check order: `401` with no valid token, else `400` with `body` (plain
-/// when `body` is `None`). Emits the `upload` metric either way.
-fn bad_path_response(obs: &Obs, agent: Option<Agent>, body: Option<&'static str>) -> Response {
-    match agent {
-        None => {
-            record_upload(obs, None, Outcome::Unauthorized);
-            StatusCode::UNAUTHORIZED.into_response()
-        }
-        Some(agent) => {
-            record_upload(obs, Some(&agent.name), Outcome::BadRequest);
-            match body {
-                Some(body) => (StatusCode::BAD_REQUEST, body).into_response(),
-                None => StatusCode::BAD_REQUEST.into_response(),
-            }
-        }
+/// when `body` is `None`). Emits the `upload` metric and its paired log
+/// line either way; no file was named, so id, filename, and size are `-`.
+fn bad_path_response(
+    obs: &Obs,
+    agent: Option<Agent>,
+    client_ip: IpAddr,
+    body: Option<&'static str>,
+) -> Response {
+    let agent = agent.map(|a| a.name);
+    let outcome = match agent {
+        None => Outcome::Unauthorized,
+        Some(_) => Outcome::BadRequest,
+    };
+    record_upload(obs, agent.as_deref(), outcome);
+    tracing::info!(
+        agent = log_str(agent.as_deref()),
+        id = log_str(None),
+        filename = log_str(None),
+        size = %log_size(None),
+        client_ip = %client_ip,
+        result = outcome.as_str(),
+        "upload request handled"
+    );
+    match (outcome, body) {
+        (Outcome::Unauthorized, _) => StatusCode::UNAUTHORIZED.into_response(),
+        (_, Some(body)) => (StatusCode::BAD_REQUEST, body).into_response(),
+        (_, None) => StatusCode::BAD_REQUEST.into_response(),
     }
 }
 
@@ -411,8 +430,9 @@ fn bad_path_response(obs: &Obs, agent: Option<Agent>, body: Option<&'static str>
 pub async fn put_bad_path(
     State(state): State<AppState>,
     MaybeAgent(agent): MaybeAgent,
+    client: ClientAddr,
 ) -> Response {
-    bad_path_response(&state.obs, agent, None)
+    bad_path_response(&state.obs, agent, client.ip, None)
 }
 
 /// The router's fallback. Any method other than `PUT` on an unmatched path
@@ -421,6 +441,7 @@ pub async fn put_bad_path(
 pub async fn fallback(
     State(state): State<AppState>,
     MaybeAgent(agent): MaybeAgent,
+    client: ClientAddr,
     method: Method,
     uri: Uri,
 ) -> Response {
@@ -428,5 +449,5 @@ pub async fn fallback(
         return StatusCode::NOT_FOUND.into_response();
     }
     let body = (uri.path() == "/").then_some(ROOT_HINT);
-    bad_path_response(&state.obs, agent, body)
+    bad_path_response(&state.obs, agent, client.ip, body)
 }
