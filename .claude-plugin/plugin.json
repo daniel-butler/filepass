@@ -1,0 +1,10 @@
+{
+  "name": "filepass",
+  "description": "Agent skill for handing files between Claude Code sessions through a filepass server: when to send by link instead of pasting, upload/download helpers, setup checks, and error handling.",
+  "version": "0.1.0",
+  "author": {
+    "name": "Daniel Butler"
+  },
+  "repository": "https://github.com/daniel-butler/filepass",
+  "license": "MIT"
+}

@@ -1,0 +1,18 @@
+{
+  "name": "filepass",
+  "owner": {
+    "name": "Daniel Butler"
+  },
+  "metadata": {
+    "description": "Claude Code plugin for filepass, a tiny server for passing files between agent sessions.",
+    "version": "0.1.0"
+  },
+  "plugins": [
+    {
+      "name": "filepass",
+      "source": "./",
+      "description": "Skill for passing large or binary data between agent sessions by link instead of pasting it into messages.",
+      "version": "0.1.0"
+    }
+  ]
+}

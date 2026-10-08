@@ -130,6 +130,32 @@ transfer (idle timeout or `max_download_duration`) — not a truncated-but-
 successful download. filepass always sets `Content-Length`, so a download
 that stops early fails rather than completing with a short file.
 
+## Claude Code skill
+
+This repo is also a Claude Code plugin. Its skill,
+`passing-files-with-filepass`, tells an agent when to send data by link
+instead of pasting it into a message, and gives it three helpers:
+`check.sh` (is filepass set up, is my token valid — stores nothing),
+`send.sh` (upload and print the block to paste into a message), and
+`fetch.sh` (download, verify the SHA-256, print the path, never the
+contents).
+
+Install it for every local session in `~/.claude/settings.json`, or for
+cloud sessions in a repo's `.claude/settings.json`:
+
+```json
+{
+  "extraKnownMarketplaces": {
+    "filepass": { "source": { "source": "github", "repo": "daniel-butler/filepass" } }
+  },
+  "enabledPlugins": { "filepass@filepass": true }
+}
+```
+
+Agents also need `FILEPASS_URL` and `FILEPASS_TOKEN` in their environment,
+and cloud environments must allow the filepass host in their network
+policy. See `skills/passing-files-with-filepass/references/setup.md`.
+
 ## Security model
 
 - **Upload token.** Each agent authenticates uploads with its own
