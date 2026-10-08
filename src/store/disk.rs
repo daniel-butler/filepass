@@ -50,6 +50,14 @@ pub fn write_json_atomic(tmp_dir: &Path, dest: &Path, value: &impl Serialize) ->
     fsync_dir(parent)
 }
 
+/// Unlinks `path`; a missing file counts as success.
+pub fn remove_file_if_exists(path: &Path) -> io::Result<()> {
+    match fs::remove_file(path) {
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+        other => other,
+    }
+}
+
 /// Fsyncs a directory so renames and unlinks inside it are durable.
 pub fn fsync_dir(dir: &Path) -> io::Result<()> {
     File::open(dir)?.sync_all()

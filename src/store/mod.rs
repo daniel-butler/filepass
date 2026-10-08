@@ -24,9 +24,18 @@
 //! `Reservation` releases its file slot and bytes on `Drop` unless `commit`
 //! converted them into committed usage; `TempFile` deletes `tmp/{id}` on
 //! `Drop` unless `commit` renamed it into `files/`.
+//!
+//! # Ending a file
+//!
+//! Revoke and expiry follow the spec's five-step protocol in `end`; the
+//! in-memory flip to `Ending` (step 1) releases the file's quota at once.
+//! `recover` reconciles the disk with the index at startup.
 
 pub mod disk;
+mod end;
 mod recover;
+
+pub use end::{ExpiredFile, RevokeOutcome, SweepReport};
 
 use std::collections::{BTreeMap, HashMap};
 use std::io;
@@ -140,6 +149,11 @@ fn whole_seconds(t: SystemTime) -> SystemTime {
 pub enum StoreError {
     #[error("{0} must be owned by the current user with mode 0700")]
     Permissions(PathBuf),
+    /// Startup recovery could not write or unlink this path; the store
+    /// refuses to open. The message shortens the file name so it never
+    /// shows a full file id.
+    #[error("startup recovery failed at {}", redact_path(.0))]
+    Recovery(PathBuf),
     #[error(transparent)]
     Io(#[from] io::Error),
 }
@@ -156,7 +170,29 @@ pub enum ReserveError {
     Insufficient,
 }
 
-/// Warnings from startup recovery, for the caller to log.
+/// Shortens `name` to its first 8 characters, the most of a file id that
+/// may appear in a log line.
+fn redact(name: &str) -> String {
+    match name.char_indices().nth(8) {
+        Some((cut, _)) => format!("{}…", &name[..cut]),
+        None => name.to_string(),
+    }
+}
+
+/// `path` with its file name shortened by `redact`.
+fn redact_path(path: &Path) -> String {
+    let name = path
+        .file_name()
+        .map(|n| redact(&n.to_string_lossy()))
+        .unwrap_or_default();
+    match path.parent() {
+        Some(parent) => parent.join(name).display().to_string(),
+        None => name,
+    }
+}
+
+/// Warnings from startup recovery, for the caller to log. They never
+/// contain a full file id.
 #[derive(Debug, Default)]
 pub struct RecoveryReport {
     pub warnings: Vec<String>,
@@ -215,23 +251,53 @@ pub struct Stats {
     pub total_bytes: u64,
     /// Entries in the `live` state.
     pub live_files: usize,
-    /// Entries that are no longer live (`ending`, `expired`, `revoked`).
+    /// Stored tombstones: entries in the `expired` or `revoked` state. An
+    /// entry still `ending` counts as neither live nor a tombstone.
     pub tombstones: usize,
 }
 
 /// An index entry's in-memory state. Every transition happens under the
-/// index lock. `Ending` is the brief window of the spec's ending protocol
-/// between the in-memory flip (step 1) and the final state (step 5).
+/// index lock. `Ending` is the window of the spec's ending protocol between
+/// the in-memory flip (step 1) and the final state (step 5); it carries the
+/// state the entry is ending into.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[expect(
-    dead_code,
-    reason = "Ending/Expired/Revoked are entered by store::end and store::recover"
-)]
 enum State {
     Live,
-    Ending,
+    Ending(End),
     Expired,
     Revoked,
+}
+
+impl State {
+    /// True for a stored tombstone: `Expired` or `Revoked`.
+    fn is_tombstone(self) -> bool {
+        matches!(self, State::Expired | State::Revoked)
+    }
+}
+
+/// How a file stops being live.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum End {
+    Expired,
+    Revoked,
+}
+
+impl End {
+    /// The state written to the `.json` (step 3).
+    fn disk_state(self) -> DiskState {
+        match self {
+            End::Expired => DiskState::Expired,
+            End::Revoked => DiskState::Revoked,
+        }
+    }
+
+    /// The in-memory state once the protocol completes (step 5).
+    fn final_state(self) -> State {
+        match self {
+            End::Expired => State::Expired,
+            End::Revoked => State::Revoked,
+        }
+    }
 }
 
 /// One file known to the index.
@@ -246,10 +312,9 @@ struct Entry {
     first_download: Option<SystemTime>,
     /// True if recovery loaded this entry from disk, so its first-download
     /// time is unknown.
-    #[expect(dead_code, reason = "read by store::end when reporting expiries")]
     loaded_at_startup: bool,
-    /// When the entry entered `Ending`, so the sweeper can retry stuck ones.
-    #[expect(dead_code, reason = "set and read by store::end")]
+    /// When the entry entered `Ending` (or the sweep last retried it), so
+    /// the sweep can retry stuck ones.
     ending_since: Option<Instant>,
 }
 
@@ -269,8 +334,8 @@ struct AgentUsage {
 /// The in-memory index. Invariants, all maintained under the lock:
 ///
 /// - `live_bytes` and every `AgentUsage::{live_bytes, live_files}` sum over
-///   entries in `State::Live` only. Leaving `Live` (to `Ending`) must call
-///   the matching release in the same critical section.
+///   entries in `State::Live` only. Leaving `Live` (to `Ending`) calls
+///   `release_live` in the same critical section.
 /// - `reserved_bytes`, `reserved_slots`, `unwritten`, and every
 ///   `AgentUsage::{reserved_bytes, reserved_slots}` sum over active
 ///   `Reservation`s.
@@ -299,7 +364,12 @@ impl Index {
     }
 
     /// Inserts `entry`, counting it toward its uploader's usage if live.
+    /// The id must be new to the index.
     fn insert(&mut self, entry: Entry) {
+        debug_assert!(
+            !self.entries.contains_key(&entry.meta.id),
+            "index already holds this id"
+        );
         if entry.state == State::Live {
             let size = entry.meta.size;
             let usage = self.usage_mut(&entry.meta.uploader);
@@ -308,6 +378,15 @@ impl Index {
             self.live_bytes += size;
         }
         self.entries.insert(entry.meta.id.clone(), entry);
+    }
+
+    /// Releases a live file's committed bytes and file slot. The undo of
+    /// `insert`'s counting, called when the entry leaves `Live`.
+    fn release_live(&mut self, uploader: &str, size: u64) {
+        let usage = self.usage_mut(uploader);
+        usage.live_bytes -= size;
+        usage.live_files -= 1;
+        self.live_bytes -= size;
     }
 }
 
@@ -621,7 +700,11 @@ impl Store {
                 .collect(),
             total_bytes: idx.live_bytes,
             live_files,
-            tombstones: idx.entries.len() - live_files,
+            tombstones: idx
+                .entries
+                .values()
+                .filter(|e| e.state.is_tombstone())
+                .count(),
         }
     }
 
@@ -823,16 +906,17 @@ mod tests {
 
     const MIB: u64 = 1 << 20;
 
-    struct Harness {
-        dir: TempDir,
-        store: Arc<Store>,
-        clock: Arc<TestClock>,
+    pub(super) struct Harness {
+        pub(super) dir: TempDir,
+        pub(super) cfg: Config,
+        pub(super) store: Arc<Store>,
+        pub(super) clock: Arc<TestClock>,
     }
 
     /// Opens a store in a fresh 0700 `TempDir`, with `tweak` applied to the
     /// spec-default config. Free space and inodes are pinned high so tests do
     /// not depend on the host disk.
-    fn harness(tweak: impl FnOnce(&mut Config)) -> Harness {
+    pub(super) fn harness(tweak: impl FnOnce(&mut Config)) -> Harness {
         let dir = TempDir::new().expect("tempdir");
         fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o700)).expect("chmod");
         let mut cfg = Config::for_tests(dir.path().to_path_buf());
@@ -844,7 +928,12 @@ mod tests {
         assert!(report.warnings.is_empty());
         let store = Arc::new(store);
         store.set_fs_override(Some((1 << 50, 1 << 40)));
-        Harness { dir, store, clock }
+        Harness {
+            dir,
+            cfg,
+            store,
+            clock,
+        }
     }
 
     fn new_file(id: &str, size: u64) -> NewFile {
@@ -861,7 +950,7 @@ mod tests {
 
     /// Reserves, writes `body`, and commits one file for `planner`. The
     /// commit runs in a spawned task, as the upload handler runs it.
-    async fn upload(h: &Harness, body: &[u8]) -> Meta {
+    pub(super) async fn upload(h: &Harness, body: &[u8]) -> Meta {
         let res = h
             .store
             .reserve("planner", Some(body.len() as u64))
@@ -877,7 +966,7 @@ mod tests {
             .expect("commit")
     }
 
-    fn dir_entries(path: &Path) -> Vec<String> {
+    pub(super) fn dir_entries(path: &Path) -> Vec<String> {
         fs::read_dir(path)
             .expect("read_dir")
             .map(|e| e.expect("entry").file_name().to_string_lossy().into_owned())
