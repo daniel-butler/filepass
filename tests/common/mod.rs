@@ -18,7 +18,8 @@ use filepass::obs::{Obs, Recorder};
 use filepass::sweeper::Sweeper;
 
 use tempfile::TempDir;
-use tokio::net::TcpListener;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
+use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 
@@ -156,10 +157,72 @@ impl TestServer {
         start.elapsed()
     }
 
-    fn token(&self, agent: &str) -> &str {
+    /// Opens a raw TCP connection and writes the head of
+    /// `PUT <path>` with `Content-Length: <content_length>` (and a bearer
+    /// token when `agent` names a test agent), but no body. The caller
+    /// controls the body: send it all, trickle it, stall, or close. For
+    /// behaviour reqwest can't express.
+    pub async fn raw_put(&self, path: &str, agent: Option<&str>, content_length: u64) -> TcpStream {
+        let addr = self.url.trim_start_matches("http://");
+        let mut stream = TcpStream::connect(addr)
+            .await
+            .expect("connect to test server");
+        let mut head =
+            format!("PUT {path} HTTP/1.1\r\nHost: {addr}\r\nContent-Length: {content_length}\r\n");
+        if let Some(agent) = agent {
+            head.push_str(&format!("Authorization: Bearer {}\r\n", self.token(agent)));
+        }
+        head.push_str("\r\n");
+        stream
+            .write_all(head.as_bytes())
+            .await
+            .expect("write request head");
+        stream
+    }
+
+    /// The bearer token of test agent `agent`.
+    pub fn token(&self, agent: &str) -> &str {
         self.tokens
             .get(agent)
             .unwrap_or_else(|| panic!("unknown test agent {agent:?}"))
+    }
+}
+
+/// Reads the status code of the HTTP response arriving on `stream` (a
+/// `raw_put` connection or its read half), failing the test if no status
+/// line arrives within 5 s.
+pub async fn read_status<R: AsyncRead + Unpin>(stream: &mut R) -> u16 {
+    let read_line = async {
+        let mut line = Vec::new();
+        let mut byte = [0u8; 1];
+        while !line.ends_with(b"\r\n") {
+            let n = stream.read(&mut byte).await.expect("read response");
+            assert!(n > 0, "connection closed before a status line arrived");
+            line.push(byte[0]);
+        }
+        line
+    };
+    let line = tokio::time::timeout(Duration::from_secs(5), read_line)
+        .await
+        .expect("no response status within 5 s");
+    let line = String::from_utf8(line).expect("status line is UTF-8");
+    line.split(' ')
+        .nth(1)
+        .and_then(|code| code.parse().ok())
+        .unwrap_or_else(|| panic!("malformed status line {line:?}"))
+}
+
+/// Polls `cond` every 20 ms for up to 2 s; true once it holds.
+pub async fn eventually(mut cond: impl FnMut() -> bool) -> bool {
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        if cond() {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
     }
 }
 
