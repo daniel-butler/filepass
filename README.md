@@ -23,11 +23,25 @@ This prints a token and its SHA-256. Put the hash in your config under
 `[agents.<name>]`; give the token to the agent. The config stores only the
 hash, so a leaked config file grants no access.
 
+Create the data directory. filepass refuses to start unless `data_dir` is
+owned by the user it runs as, with mode `0700`:
+
+```
+install -d -m 0700 /var/lib/filepass
+```
+
+(Under systemd, `StateDirectory=` creates it for you; see Deployment.)
+
 Write a config (see `deploy/filepass.example.toml`) and start the server:
 
 ```
 filepass serve --config /etc/filepass/filepass.toml
 ```
+
+Once startup recovery finishes and the listener is bound, filepass logs
+`listening on 127.0.0.1:8080` (your `listen` address). Only one filepass
+may use a `data_dir` at a time: a second one finds `data_dir/lock` held and
+refuses to start. `filepass --version` prints the version.
 
 ## Agent usage
 
@@ -63,11 +77,22 @@ curl -X DELETE -H "Authorization: Bearer $FILEPASS_TOKEN" https://filepass.host/
 Only the uploading agent's token can revoke a file. Revocation is immediate:
 it aborts any download of that file already in progress.
 
-Check the downloaded bytes against the hash the upload returned:
+Check the downloaded bytes against the hash the upload returned. Save the
+upload's response headers to capture `Filepass-SHA256`:
+
+```
+curl -T build.zip -H "Authorization: Bearer $FILEPASS_TOKEN" -D headers.txt https://filepass.host/
+FILEPASS_SHA256=$(grep -i '^filepass-sha256:' headers.txt | cut -d' ' -f2 | tr -d '\r')
+```
+
+and, after downloading:
 
 ```
 echo "$FILEPASS_SHA256  build.zip" | sha256sum -c
 ```
+
+The download response carries the same `Filepass-SHA256` header, so the
+downloader can also take the hash from there.
 
 ### Status codes
 
@@ -133,12 +158,22 @@ clients that send headers slowly.
 See `deploy/filepass.service`. It runs as a dedicated unprivileged user,
 with `StateDirectory=filepass` (mode `0700`), `ProtectSystem=strict`, and
 `LimitNOFILE=65536` so upload and download file descriptors never approach
-the process limit. Copy it to `/etc/systemd/system/filepass.service`,
-adjust the binary path if needed, and:
+the process limit. The unit sets `User=filepass` with `DynamicUser=no`, so
+create that system user first:
+
+```
+useradd --system --user-group --no-create-home --shell /usr/sbin/nologin filepass
+```
+
+systemd then creates `/var/lib/filepass` owned by `filepass` with mode
+`0700`, matching `data_dir = "/var/lib/filepass"`. Copy the unit to
+`/etc/systemd/system/filepass.service`, adjust the binary path if needed,
+and:
 
 ```
 systemctl daemon-reload
 systemctl enable --now filepass
+journalctl -u filepass    # look for "listening on 127.0.0.1:8080"
 ```
 
 ### nginx
@@ -194,13 +229,18 @@ lands in journald. `log_format` (`text` or `json`) selects the format.
 A metric is one structured log event on the `metric` tracing target, with
 fields `metric=<name>`, its labels, and `value` (the increment for
 counters, the reading for gauges, or milliseconds for timings). For
-example, a successful upload emits something like:
+example, with `log_format = "text"` a successful upload logs (timestamps
+trimmed):
 
 ```
-metric=upload agent=planner result=ok value=1
-metric=upload_bytes agent=planner value=734003200
-metric=upload_duration_ms agent=planner value=842 unit=ms
+INFO request{method=PUT route=/{filename}}: metric: metric="upload" agent="planner" result="ok" value=1.0
+INFO request{method=PUT route=/{filename}}: metric: metric="upload_bytes" agent="planner" value=734003200.0
+INFO request{method=PUT route=/{filename}}: metric: metric="upload_duration_ms" agent="planner" value=842.0 unit="ms"
+INFO request{method=PUT route=/{filename}}: filepass::upload: upload request handled agent="planner" id="3f9c2a7e" filename="build.zip" size=734003200 client_ip=203.0.113.7 result="ok"
 ```
+
+The last line is the readable log line paired with the counters. With
+`log_format = "json"` the same fields arrive as JSON objects.
 
 Each counter and timing is paired with a readable log line at the same call
 site, so operators can read the log or count the metric. A log shipper such

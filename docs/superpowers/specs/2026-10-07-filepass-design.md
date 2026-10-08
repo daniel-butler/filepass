@@ -253,6 +253,7 @@ connection with body bytes unread. curl often reports this as a send error
 
 ```
 data_dir/
+  lock              held with an exclusive lock while filepass runs
   tmp/              uploads and metadata writes in progress; emptied at startup
   files/{id}        file contents
   files/{id}.json   metadata
@@ -358,7 +359,11 @@ future, and only `Drop` runs then, so explicit release calls are not enough.
 
 ### Startup recovery
 
-Recovery runs to completion before the listener binds. If a recovery write
+Recovery runs to completion before the listener binds. Before it starts,
+filepass takes an exclusive, non-blocking lock on `data_dir/lock` and holds
+it for its lifetime; if another process holds it, filepass refuses to start,
+so a second instance never empties a running one's `tmp/`. Recovery touches
+only `tmp/` and `files/`. If a recovery write
 or unlink fails, filepass refuses to start and logs the path; a disk that
 cannot complete recovery cannot serve safely either.
 
@@ -467,8 +472,9 @@ append a client-supplied one (see Deployment).
 
 Every "per IP" limit and label in this spec means per client key. The client
 key — the IPv6 /64 prefix, since one host commonly controls a
-whole /64, or the full IPv4 address — drives `max_downloads_per_ip` and
-appears in logs. A per-key download counter exists only while that key has
+whole /64, or the full IPv4 address — drives `max_downloads_per_ip`. Logs
+show the full client IP, not the key, because operators need the real
+address. A per-key download counter exists only while that key has
 downloads in progress, so the table never grows beyond
 `max_concurrent_downloads` entries.
 
@@ -555,7 +561,9 @@ filepass validates the config at startup and refuses to run on errors:
   agent name, or an unparseable `trusted_proxies` entry;
 - `default_ttl` above `max_ttl`;
 - any duration, count, size, or rate that is zero, except `min_free_space`
-  and `min_free_inodes`.
+  and `min_free_inodes`;
+- any duration above 100 years, or an `upload_rate` that does not fit in 32
+  bits.
 
 ## Shutdown
 
