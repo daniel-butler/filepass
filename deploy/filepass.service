@@ -1,0 +1,22 @@
+[Unit]
+Description=filepass file-drop server
+After=network.target
+
+[Service]
+Type=simple
+User=filepass
+DynamicUser=no
+StateDirectory=filepass
+StateDirectoryMode=0700
+ExecStart=/usr/local/bin/filepass serve --config /etc/filepass/filepass.toml
+Restart=on-failure
+
+ProtectSystem=strict
+ProtectHome=yes
+NoNewPrivileges=yes
+PrivateTmp=yes
+LimitNOFILE=65536
+TimeoutStopSec=90
+
+[Install]
+WantedBy=multi-user.target

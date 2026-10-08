@@ -1,0 +1,40 @@
+# Example filepass configuration. Copy to /etc/filepass/filepass.toml,
+# fill in public_url, and add an [agents.*] section per agent.
+#
+# Generate each agent's token and hash with `filepass token`. Put the hash
+# here; give the token to the agent. Never put a raw token in this file.
+
+listen                   = "127.0.0.1:8080"
+public_url               = "https://filepass.host"
+data_dir                 = "/var/lib/filepass"
+log_format               = "text"      # or "json"
+trusted_proxies          = ["127.0.0.1", "::1"]
+
+max_file_size            = "2GiB"
+default_ttl              = "30m"
+max_ttl                  = "24h"
+tombstone_ttl            = "48h"
+max_tombstones           = 200000
+upload_idle_timeout      = "60s"
+max_upload_duration      = "1h"
+download_idle_timeout    = "60s"
+max_download_duration    = "2h"
+shutdown_grace           = "30s"
+
+total_quota              = "50GiB"
+agent_quota              = "10GiB"
+max_files                = 1000
+min_free_space           = "5GiB"
+min_free_inodes          = 10000
+
+upload_rate              = 60          # uploads per agent per minute
+max_concurrent_uploads   = 32
+max_uploads_per_agent    = 8
+max_concurrent_downloads = 64
+max_downloads_per_ip     = 8
+
+[agents.planner]
+token_sha256 = "0000000000000000000000000000000000000000000000000000000000000000"
+
+[agents.builder]
+token_sha256 = "1111111111111111111111111111111111111111111111111111111111111111"
