@@ -1,7 +1,7 @@
 # filepass — design
 
 Date: 2026-10-07
-Status: draft, revised after three reviews and a threat-model pass, awaiting approval
+Status: draft, revised after four reviews and a threat-model pass, awaiting approval
 License: MIT
 Repo: `daniel-butler/filepass`
 
@@ -112,8 +112,22 @@ path yields `405`, not the router fallback. filepass wires routes explicitly:
 | fallback (`PUT`) | `PUT /` and deeper paths → `400` |
 | fallback (other) | `404` |
 
-Any other method on a matched path returns `405`. `400` and `405` never charge
-the failure budget: neither reveals anything about tokens or ids.
+Any other method on a matched path returns `405`. Because `/{filename}`
+matches every single-segment path, `GET /favicon.ico` returns `405`, not
+`404`. `400` and `405` never charge the failure budget: neither reveals
+anything about tokens or ids. `GET /healthz` is exempt from the lockout and
+never charges the budget, so monitoring keeps working.
+
+**Path decoding.** Handlers never use axum's `Path<String>` or
+`RawPathParams` extractors: both reject invalid percent-encoding with their
+own `400` before the handler runs, which would pre-empt the `401`/`429` steps.
+Handlers read the raw segment from the `Uri` and decode it themselves.
+
+**The gate.** One middleware, `gate.rs`, wraps every route. Before the
+handler, it resolves the client key, checks any bearer token into an
+`Option<Agent>`, and applies the lockout. After the handler, it charges the
+failure budget when the response is `401`, `403`, or `404`. Handlers never
+touch the failure budget.
 
 ### Download: `GET /d/{id}/{urlname}` (also `HEAD`)
 
@@ -127,9 +141,27 @@ curl -C - -fO https://filepass.host/d/3f9c.../build.zip   # resume
   except that a valid token bypasses an IP lockout (see Abuse protection).
 - `{id}` is 128 random bits as 32 lowercase hex characters. It cannot be
   guessed, so the URL itself is the credential.
-- `{urlname}` must equal the stored URL-safe name; a mismatch returns `404`.
-- Supports single-range `Range` requests, so interrupted downloads resume. An
-  unsatisfiable range returns `416` with `Content-Range: bytes */<size>`.
+- `{urlname}` must equal the stored URL-safe name byte for byte, compared as
+  the raw segment (URL-safe names contain nothing to percent-decode); a
+  mismatch returns `404`.
+- axum routes `HEAD` to the `GET` handler. The handler branches on method
+  before step 5 of the check order, so `HEAD` never takes a slot or spawns a
+  producer.
+- Supports single-range `Range` requests, so interrupted downloads resume.
+  filepass parses `Range` itself; the forms are `bytes=a-b`, `bytes=a-`, and
+  `bytes=-n`:
+  - A malformed header, a multi-range header, or any `Range` on an empty file
+    is ignored: `200` with the whole file, per RFC 9110.
+  - `bytes=-n` with `n` ≥ size serves the whole file as `206`.
+  - `b` beyond the end is clamped to the last byte.
+  - A start at or beyond the size of a non-empty file returns `416` with
+    `Content-Range: bytes */<size>`.
+- **Every response sets `Content-Length`** (the range length on `206`, with
+  `Content-Range`). A body streamed without it goes out chunked, and when the
+  producer stops early hyper sends a clean terminating chunk: curl would
+  report success on a truncated file. With `Content-Length` set, an early stop
+  closes the connection short, and curl fails (exit 18). This is what makes
+  revocation, `max_download_duration`, and read errors visible to B.
 - Response headers:
   - `Content-Type: application/octet-stream`, always
   - `Content-Disposition: attachment; filename="<urlname>"; filename*=UTF-8''<percent-encoded original>`
@@ -150,6 +182,11 @@ curl -C - -fO https://filepass.host/d/3f9c.../build.zip   # resume
      `max_concurrent_downloads` → `503`
   6. Open the file and serve it; the file vanishing between step 3 and the
      open → `410`
+
+  Steps 2–3 read the state, size, and cancellation token in one acquisition
+  of the index lock. The lock is a `std::sync::Mutex` and is never held across
+  an `.await`, so the open in step 6 happens after the lock is released; the
+  `410`-on-vanish rule covers the gap.
 - **Expiry mid-download:** a download in progress when the file expires
   finishes, subject to `max_download_duration`.
 - **Revoke mid-download:** revocation aborts every download of that file in
@@ -189,7 +226,7 @@ Returns `200 ok`. No auth.
 | 400 | Bad path, filename, or `Filepass-TTL` |
 | 401 | Missing or unknown token |
 | 403 | DELETE by an agent that did not upload the file |
-| 404 | Unknown id, or name mismatch |
+| 404 | Unknown id, name mismatch, or no route |
 | 405 | Method not allowed on a matched path |
 | 408 | Upload stalled or exceeded `max_upload_duration` |
 | 410 | The file existed but has expired or been revoked |
@@ -198,11 +235,14 @@ Returns `200 ok`. No auth.
 | 429 | IP locked out; or a per-agent or per-IP limit reached |
 | 500 | Disk or I/O error; logged with detail and the id prefix, never the full id |
 | 503 | A server-wide concurrency limit reached |
-| 507 | Would exceed the agent quota, `max_files`, the total quota, or the free-space floor |
+| 507 | Would exceed the agent quota, `max_files`, the total quota, or the free-space or free-inode floor |
 
 `410` differs from `404` on purpose. It tells B to ask A for a fresh upload,
-where `404` means the link was never valid. Every `429` and `503` carries
-`Retry-After`.
+where `404` means the link was never valid.
+
+Every `429` and `503` carries `Retry-After`: the remaining lockout for an IP
+lockout, the time until the next token for the upload rate, and `1` for
+concurrency limits.
 
 **Early rejection.** When filepass rejects an upload before reading its body
 (`400`, `401`, `413`, `429`, `503`, or `507`), the server closes the
@@ -255,6 +295,14 @@ Unique temp names mean concurrent writers can never interleave in one file.
 A link is live only once its `.json` exists and the index holds it. No crash
 can produce a live link to a partial file.
 
+**The commit cannot be cancelled.** Once the body is fully received, the
+handler hands the temp file and its reservation guard to a spawned task, which
+runs steps 2–3 and the index insert, and the handler awaits it. If the client
+disconnects, hyper drops only the handler; the spawned task still finishes, so
+no blob is left in `files/` without its `.json` while its reservation is
+released. A file committed after its uploader disconnected simply expires
+unused.
+
 ### Index states and ending a file
 
 Each index entry has an in-memory state: `live`, `ending`, `expired`, or
@@ -294,7 +342,10 @@ future, and only `Drop` runs then, so explicit release calls are not enough.
 
 - Upload guards live in the handler and drop on every exit: success, `4xx`,
   `5xx`, timeout, or disconnect. A rejection at step 6 or 7 releases the
-  step-4 concurrency guard.
+  step-4 concurrency guard. The reservation guard moves into the commit task
+  once the body is complete.
+- The temp-file guard belongs to `store.rs`; its `Drop` deletes the temp file
+  unless the commit renamed it.
 - On success, the byte reservation converts into the file's committed usage
   under the index lock, in the same step that inserts the entry.
 - If the `.json` write fails after the blob was renamed into `files/`,
@@ -304,7 +355,9 @@ future, and only `Drop` runs then, so explicit release calls are not enough.
 
 ### Startup recovery
 
-Recovery runs to completion before the listener binds.
+Recovery runs to completion before the listener binds. If a recovery write
+or unlink fails, filepass refuses to start and logs the path; a disk that
+cannot complete recovery cannot serve safely either.
 
 | Found | Action |
 |---|---|
@@ -313,7 +366,10 @@ Recovery runs to completion before the listener binds.
 | A blob with no `.json` | Delete |
 | A `.json` that fails to parse | Delete it and its blob; log a warning |
 | `expired`/`revoked` `.json` whose blob still exists | Delete the blob |
-| `live` `.json` with no blob | Mark `expired`, `ended_at` = now |
+| A `.json` whose `id` differs from its filename | Delete it and its blob; log a warning |
+| `live` `.json` whose `size` differs from the blob's length | Delete both; log a warning |
+| `live` `.json` with no blob | Write it as `expired`, `ended_at` = now |
+| `.json` whose `uploader` is no longer in the config | Load normally; it counts toward no configured agent and expires on schedule |
 | `live` `.json` past `expires_at` | End it as expired (steps 3–4 above), `ended_at` = `expires_at` |
 | `expired`/`revoked` `.json` past `ended_at + tombstone_ttl` | Delete |
 
@@ -356,6 +412,7 @@ Every upload passes these limits:
 - `max_files` (1000) live files per agent, plus uploads in progress
 - `total_quota` (50 GiB), all agents, live files plus reservations
 - `min_free_space` (5 GiB), measured with `nix::sys::statvfs`
+- `min_free_inodes` (10,000), measured as `f_favail` from the same call
 
 The free-space check accounts for bytes promised but not yet written:
 
@@ -389,7 +446,8 @@ on a firewall or fail2ban.
 
 filepass trusts forwarding headers only from `trusted_proxies` (default
 `127.0.0.1` and `::1`). Entries are CIDRs or bare addresses; a bare address
-means /32 or /128. filepass normalises IPv4-mapped IPv6 addresses with
+means /32 or /128. `ipnet` rejects bare addresses, so the parser falls back
+to `IpAddr` and converts with `IpNet::from`. filepass normalises IPv4-mapped IPv6 addresses with
 `to_canonical()` before every match and before keying. When the socket peer is a trusted proxy, the client IP
 is the rightmost `X-Forwarded-For` entry that is not itself a trusted proxy.
 Otherwise the client IP is the socket peer, and filepass ignores any
@@ -477,6 +535,7 @@ total_quota              = "50GiB"
 agent_quota              = "10GiB"
 max_files                = 1000
 min_free_space           = "5GiB"
+min_free_inodes          = 10000
 
 failure_budget           = 20          # failed requests per client ...
 failure_window           = "1m"        # ... within this window
@@ -500,7 +559,8 @@ filepass validates the config at startup and refuses to run on errors:
 - unknown keys, a malformed `public_url`, duplicate token hashes, an invalid
   agent name, or an unparseable `trusted_proxies` entry;
 - `default_ttl` above `max_ttl`;
-- any duration, count, size, or rate that is zero, except `min_free_space`.
+- any duration, count, size, or rate that is zero, except `min_free_space`
+  and `min_free_inodes`.
 
 ## Shutdown
 
@@ -517,9 +577,11 @@ filepass writes everything through `tracing` to stdout; under systemd it lands
 in journald. `log_format` selects text or JSON. Nothing leaves the server.
 
 A metric is one structured event on the `metric` tracing target with fields
-`metric=<name>`, its labels, and `value` (`1` for counters; the reading for
-gauges; milliseconds for timings, with `unit="ms"`). Each is paired with a
-readable log line at the same call site: count the metric, read the log. A
+`metric=<name>`, its labels, and `value`: the increment for counters (`1`,
+or the byte count for `*_bytes`), the reading for gauges, and milliseconds for
+timings, with `unit="ms"`. Each counter and timing is paired with a readable
+log line at the same call site: count the metric, read the log. Gauges emit no
+log line; they would add a dozen lines of noise every minute. A
 log shipper such as Vector can turn these events into counters without code
 changes.
 
@@ -543,11 +605,14 @@ changes.
 | `uploads_in_flight` | gauge | — | each sweep |
 | `downloads_in_flight` | gauge | — | each sweep |
 
+`upload` and `download` are emitted from a guard's `Drop`, so a disconnect
+still produces exactly one event, with `result=client_aborted`.
+
 `agent` is `-` when no valid token was presented. `reason` is one of
 `ip_lockout`, `upload_rate`, `uploads_per_agent`, `uploads_total`,
 `downloads_per_ip`, `downloads_total`.
 
-Every `GET` emits `download` exactly once: rejected requests when they are
+Every `GET /d/...` emits `download` exactly once: rejected requests when they are
 rejected, served requests from the producer task's guard when the transfer
 ends (`ok`, `client_aborted`, `revoked`, `timeout`, or `error`). `HEAD`
 requests emit nothing.
@@ -558,10 +623,29 @@ Range resumes never reset it.
 `expired_undownloaded` skips files loaded at startup, because their
 first-download time was not persisted and is unknown.
 
-`result` takes a fixed set of values: `ok`, `unauthorized`, `forbidden`,
-`not_found`, `gone`, `too_large`, `range_not_satisfiable`,
-`insufficient_storage`, `timeout`, `bad_request`, `busy`, `rate_limited`,
-`revoked`, `client_aborted`, `error`.
+`result` takes exactly these values:
+
+| Status or condition | `result` | `throttled` `reason` |
+|---|---|---|
+| `201`, `200`, `206`, `204` | `ok` | — |
+| `400` | `bad_request` | — |
+| `401` | `unauthorized` | — |
+| `403` | `forbidden` | — |
+| `404` | `not_found` | — |
+| `408`, or a download dropped by an idle or duration limit | `timeout` | — |
+| `410` | `gone` | — |
+| `413` | `too_large` | — |
+| `416` | `range_not_satisfiable` | — |
+| `429` from IP lockout | `rate_limited` | `ip_lockout` |
+| `429` from upload rate | `rate_limited` | `upload_rate` |
+| `429` from per-agent uploads | `busy` | `uploads_per_agent` |
+| `429` from per-key downloads | `busy` | `downloads_per_ip` |
+| `503` from server-wide uploads | `busy` | `uploads_total` |
+| `503` from server-wide downloads | `busy` | `downloads_total` |
+| `507` | `insufficient_storage` | — |
+| `500`, or a read error mid-download | `error` | — |
+| Download aborted by revoke | `revoked` | — |
+| Client disconnected | `client_aborted` | — |
 
 Labels never include file ids, filenames, or IPs, which keeps series count
 bounded.
@@ -592,24 +676,26 @@ reads those logs.
 | Module | Responsibility |
 |---|---|
 | `main.rs` | CLI (`serve`, `token`), startup, shutdown |
+| `app.rs` | `AppState` and router assembly |
+| `gate.rs` | Middleware: client key, optional token, lockout, failure-budget charging |
+| `range.rs` | Single-range `Range` parsing per the rules above |
 | `config.rs` | Parse and validate TOML; size and duration types |
 | `auth.rs` | Token hashing and lookup; `Agent` extractor |
 | `client_ip.rs` | Trusted-proxy resolution and IPv6 /64 keying |
 | `names.rs` | Filename validation and URL-safe name derivation |
 | `store.rs` | Blob and metadata files, index and its states, reservations, recovery |
-| `upload.rs` | PUT handler and fallback: check order, streaming, hashing, limits, timeouts |
+| `upload.rs` | PUT handler and fallback: check order, streaming, hashing, limits, timeouts, commit task |
 | `download.rs` | GET, HEAD, and DELETE handlers; range serving; cancellation |
-| `limits.rs` | Failure budget, upload rate, concurrency caps |
-| `sweeper.rs` | Expiry, tombstone removal, gauge emission |
+| `limits.rs` | Failure-budget table, upload rate, concurrency caps and their guards |
+| `sweeper.rs` | Expiry, tombstone removal, gauge emission; `run_once()` for tests |
 | `obs.rs` | Metric event helpers |
 | `clock.rs` | `Clock` trait; system clock and a test clock |
 
 **Downloads do not use tower-http's `ServeFile`.** `ServeFile` opens the file
 by path after the handler's index check, so a concurrent revoke or expiry turns
 an intended `410` into `404`. It also emits its own ETag and Last-Modified.
-filepass instead opens the file descriptor while holding the index entry,
-maps a vanished file to `410`, and parses `Range` with the `http-range-header`
-crate.
+filepass instead checks the index, opens the file itself, and maps a vanished
+file to `410`.
 
 **Downloads run in a producer task.** A timer inside the response body cannot
 enforce `download_idle_timeout`: when the client stops reading, hyper's write
@@ -627,10 +713,11 @@ disconnects (the receiver drops).
 buffering extractors, so axum's 2 MB `DefaultBodyLimit` never applies and no
 upload is held in memory.
 
-Main crates: `axum`, `tokio`, `tokio-util`, `http-range-header`, `sha2`,
-`rand`, `serde`, `serde_json`, `toml`, `humantime`, `tracing`,
-`tracing-subscriber`, `clap`, `ipnet`, and `nix` (`fs` feature, for
-`statvfs`).
+Main crates: `axum`, `tokio`, `tokio-util` (`CancellationToken`),
+`futures-util`, `sha2`, `hex`, `base64`, `rand`, `serde`, `serde_json`,
+`toml`, `humantime`, `percent-encoding`, `tracing`, `tracing-subscriber`,
+`clap`, `ipnet`, and `nix` (`fs` feature, for `statvfs`). filepass does not
+use `tower-http`.
 
 ## Deployment
 
@@ -666,7 +753,8 @@ Main crates: `axum`, `tokio`, `tokio-util`, `http-range-header`, `sha2`,
 ## Testing
 
 Integration tests start the real server on a random port with a temp
-`data_dir` and an injected test clock. They cover:
+`data_dir` and an injected test clock. Tests trigger sweeps with
+`Sweeper::run_once()`, since the test clock does not drive tokio's interval. They cover:
 
 - Upload then download round trip; the SHA-256 header matches the bytes.
 - `curl -T file URL/` and `curl -T - URL/name` both work, run with the real
@@ -688,7 +776,17 @@ Integration tests start the real server on a random port with a temp
 - DELETE order: `401`, `404`, `403`, `410`, `204`.
 - Concurrent revokes, and a revoke racing the sweeper: exactly one wins; the
   other gets `410` or skips.
-- Revoke aborts a download in progress.
+- Revoke aborts a download in progress, and real curl exits non-zero (18)
+  rather than saving a truncated file as complete. Same for
+  `max_download_duration`.
+- A client that disconnects right after sending the full body still leaves a
+  committed file with its `.json`, and no orphaned blob.
+- Range edge cases: empty file, malformed header, multi-range, suffix longer
+  than the file, end beyond the file, start beyond the file.
+- `PUT /a%FFb` without a token returns `401`, not `400`.
+- `HEAD` takes no download slot and emits no `download` event.
+- Startup recovery with a size mismatch, an id mismatch, and an uploader
+  missing from the config.
 - A failed `.json` write during revoke answers `500`, keeps the link dead, and
   the sweeper completes the revoke on retry.
 - A download whose client stops reading releases its slot and descriptor
