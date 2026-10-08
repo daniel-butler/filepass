@@ -1,7 +1,7 @@
 # filepass — design
 
 Date: 2026-10-07
-Status: draft, revised after four reviews and a threat-model pass, awaiting approval
+Status: draft, revised after four reviews; failure budget removed and a threat-model pass, awaiting approval
 License: MIT
 Repo: `daniel-butler/filepass`
 
@@ -24,8 +24,8 @@ permanent: every file expires, by default after 30 minutes.
 - Each agent authenticates uploads with its own token.
 - Links expire. The uploader can revoke one early, and revocation is immediate.
 - The server never exhausts its disk, inodes, file descriptors, or memory.
-- Strangers on the internet cannot store files, guess tokens, scan for links,
-  or lock out legitimate agents.
+- Strangers on the internet cannot store files, and cannot tie up the server
+  with downloads or slow connections.
 - Operators see what happens through structured logs and metric events.
 - Nothing leaves the server. No phone-home telemetry.
 
@@ -63,8 +63,8 @@ query string stops curl from appending the filename.
   `max_ttl` (24h), and unparseable values return `400`.
 - **Path:** exactly one non-empty segment. `PUT /` returns `400` with the
   body `name the file: PUT /<filename> (curl -T - needs an explicit name)`;
-  a `PUT` to any path with more than one segment returns `400`. Both run check
-  steps 1–2 first, so an untokened request gets `401`. `PUT /healthz` uploads
+  a `PUT` to any path with more than one segment returns `400`. Both check
+  the token first, so an untokened request gets `401`. `PUT /healthz` uploads
   a file named `healthz` like any other name. See Routing for how axum is
   wired to deliver these responses.
 - **Filename:** the segment, percent-decoded. filepass returns `400` when the
@@ -88,16 +88,15 @@ query string stops curl from appending the filename.
 **Check order.** filepass evaluates an upload in this order and stops at the
 first failure:
 
-1. IP lockout, unless the request carries a valid token → `429`
-2. Token → `401`
-3. Path, filename, `Filepass-TTL` → `400`
-4. Agent's concurrent uploads at `max_uploads_per_agent` → `429`;
+1. Token → `401`
+2. Path, filename, `Filepass-TTL` → `400`
+3. Agent's concurrent uploads at `max_uploads_per_agent` → `429`;
    server-wide uploads at `max_concurrent_uploads` → `503`
-5. Upload rate bucket empty → `429` (only requests that reach this step spend
+4. Upload rate bucket empty → `429` (only requests that reach this step spend
    a token)
-6. Declared `Content-Length` over `max_file_size` → `413`
-7. Declared length or a new file over any quota → `507`
-8. Read the body; limits are re-checked as bytes arrive (see Space protection)
+5. Declared `Content-Length` over `max_file_size` → `413`
+6. Declared length or a new file over any quota → `507`
+7. Read the body; limits are re-checked as bytes arrive (see Space protection)
 
 ### Routing
 
@@ -114,20 +113,16 @@ path yields `405`, not the router fallback. filepass wires routes explicitly:
 
 Any other method on a matched path returns `405`. Because `/{filename}`
 matches every single-segment path, `GET /favicon.ico` returns `405`, not
-`404`. `400` and `405` never charge the failure budget: neither reveals
-anything about tokens or ids. `GET /healthz` is exempt from the lockout and
-never charges the budget, so monitoring keeps working.
+`404`.
 
 **Path decoding.** Handlers never use axum's `Path<String>` or
 `RawPathParams` extractors: both reject invalid percent-encoding with their
-own `400` before the handler runs, which would pre-empt the `401`/`429` steps.
+own `400` before the handler runs, which would pre-empt the `401` step.
 Handlers read the raw segment from the `Uri` and decode it themselves.
 
-**The gate.** One middleware, `gate.rs`, wraps every route. Before the
-handler, it resolves the client key, checks any bearer token into an
-`Option<Agent>`, and applies the lockout. After the handler, it charges the
-failure budget when the response is `401`, `403`, or `404`. Handlers never
-touch the failure budget.
+**Auth** is an `Agent` extractor in `auth.rs` that rejects with `401`. It is
+the first extractor on the upload and revoke handlers, so it runs before any
+other check.
 
 ### Download: `GET /d/{id}/{urlname}` (also `HEAD`)
 
@@ -137,15 +132,13 @@ curl -C - -fO https://filepass.host/d/3f9c.../build.zip   # resume
 ```
 
 - **No auth.** Possession of the URL grants access until expiry or revocation.
-  A download may carry an agent's `Authorization` header; it changes nothing
-  except that a valid token bypasses an IP lockout (see Abuse protection).
 - `{id}` is 128 random bits as 32 lowercase hex characters. It cannot be
   guessed, so the URL itself is the credential.
 - `{urlname}` must equal the stored URL-safe name byte for byte, compared as
   the raw segment (URL-safe names contain nothing to percent-decode); a
   mismatch returns `404`.
 - axum routes `HEAD` to the `GET` handler. The handler branches on method
-  before step 5 of the check order, so `HEAD` never takes a slot or spawns a
+  before step 4 of the check order, so `HEAD` never takes a slot or spawns a
   producer.
 - Supports single-range `Range` requests, so interrupted downloads resume.
   filepass parses `Range` itself; the forms are `bytes=a-b`, `bytes=a-`, and
@@ -174,18 +167,17 @@ curl -C - -fO https://filepass.host/d/3f9c.../build.zip   # resume
   `.html` or `.svg` cannot run script on the server's origin.
 - **Check order.** filepass evaluates a download in this order and stops at
   the first failure:
-  1. IP lockout, unless the request carries a valid token → `429`
-  2. `{id}` not 32 lowercase hex, unknown id, or name mismatch → `404`
-  3. State not `live`, or now past `expires_at` → `410`
-  4. `Range` unsatisfiable → `416`
-  5. `GET` only: client key at `max_downloads_per_ip` → `429`; server at
+  1. `{id}` not 32 lowercase hex, unknown id, or name mismatch → `404`
+  2. State not `live`, or now past `expires_at` → `410`
+  3. `Range` unsatisfiable → `416`
+  4. `GET` only: client key at `max_downloads_per_ip` → `429`; server at
      `max_concurrent_downloads` → `503`
-  6. Open the file and serve it; the file vanishing between step 3 and the
+  5. Open the file and serve it; the file vanishing between step 2 and the
      open → `410`
 
-  Steps 2–3 read the state, size, and cancellation token in one acquisition
+  Steps 1–2 read the state, size, and cancellation token in one acquisition
   of the index lock. The lock is a `std::sync::Mutex` and is never held across
-  an `.await`, so the open in step 6 happens after the lock is released; the
+  an `.await`, so the open in step 5 happens after the lock is released; the
   `410`-on-vanish rule covers the gap.
 - **Expiry mid-download:** a download in progress when the file expires
   finishes, subject to `max_download_duration`.
@@ -208,7 +200,6 @@ filepass checks in this order:
 
 | Condition | Response |
 |---|---|
-| IP locked out and no valid token | `429` |
 | Missing or unknown token | `401` |
 | Unknown id, or name mismatch | `404` |
 | Token belongs to an agent other than the uploader | `403` |
@@ -232,7 +223,7 @@ Returns `200 ok`. No auth.
 | 410 | The file existed but has expired or been revoked |
 | 413 | Larger than `max_file_size` |
 | 416 | Unsatisfiable range |
-| 429 | IP locked out; or a per-agent or per-IP limit reached |
+| 429 | A per-agent or per-client limit reached |
 | 500 | Disk or I/O error; logged with detail and the id prefix, never the full id |
 | 503 | A server-wide concurrency limit reached |
 | 507 | Would exceed the agent quota, `max_files`, the total quota, or the free-space or free-inode floor |
@@ -240,9 +231,8 @@ Returns `200 ok`. No auth.
 `410` differs from `404` on purpose. It tells B to ask A for a fresh upload,
 where `404` means the link was never valid.
 
-Every `429` and `503` carries `Retry-After`: the remaining lockout for an IP
-lockout, the time until the next token for the upload rate, and `1` for
-concurrency limits.
+Every `429` and `503` carries `Retry-After`: the time until the next token
+for the upload rate, and `1` for concurrency limits.
 
 **Early rejection.** When filepass rejects an upload before reading its body
 (`400`, `401`, `413`, `429`, `503`, or `507`), the server closes the
@@ -341,8 +331,8 @@ an RAII guard whose `Drop` releases it. A client disconnect drops the handler
 future, and only `Drop` runs then, so explicit release calls are not enough.
 
 - Upload guards live in the handler and drop on every exit: success, `4xx`,
-  `5xx`, timeout, or disconnect. A rejection at step 6 or 7 releases the
-  step-4 concurrency guard. The reservation guard moves into the commit task
+  `5xx`, timeout, or disconnect. A rejection at step 5 or 6 releases the
+  step-3 concurrency guard. The reservation guard moves into the commit task
   once the body is complete.
 - The temp-file guard belongs to `store.rs`; its `Drop` deletes the temp file
   unless the commit renamed it.
@@ -442,6 +432,12 @@ How filepass enforces the limits:
 filepass faces the internet, so it enforces its own limits rather than relying
 on a firewall or fail2ban.
 
+**What keeps strangers out is the upload token.** Without one, nothing can be
+stored. Tokens carry 256 bits and link ids 128 bits, so guessing either is
+infeasible at any request rate; filepass therefore keeps no failure counter
+or IP lockout, which would only risk locking out its own agents. The limits
+below bound load instead.
+
 ### Client IP
 
 filepass trusts forwarding headers only from `trusted_proxies` (default
@@ -454,30 +450,17 @@ Otherwise the client IP is the socket peer, and filepass ignores any
 `X-Forwarded-For` the client sent. The proxy must overwrite the header, not
 append a client-supplied one (see Deployment).
 
-IPv6 clients are keyed by their /64 prefix, since one host commonly controls a
-whole /64. IPv4 clients are keyed by full address.
-
-### Failure budget per client
-
-Every `401`, `403`, or `404` response charges the client key one unit. A key
-that spends `failure_budget` (20) units within `failure_window` (1m) is locked
-out for `failure_lockout` (10m). While locked out, requests without a valid
-token get `429` with `Retry-After`.
-
-**A valid token bypasses the lockout.** Every agent on one host shares an IP,
-so a single agent retrying with a stale token must not lock out the others,
-and an attacker must not be able to lock out legitimate agents. Checking the
-token costs one SHA-256.
-
-filepass tracks at most `max_tracked_ips` (10,000) keys. When full, it evicts
-the least recently seen key that is not locked out. It evicts an active
-lockout only when every tracked key is locked out.
+The client key — the IPv6 /64 prefix, since one host commonly controls a
+whole /64, or the full IPv4 address — drives `max_downloads_per_ip` and
+appears in logs. A per-key download counter exists only while that key has
+downloads in progress, so the table never grows beyond
+`max_concurrent_downloads` entries.
 
 ### Upload rate per agent
 
 Each agent has a token bucket of capacity `upload_rate` (60), refilling at
-`upload_rate` per minute. Uploads rejected before step 5 of the check order
-spend nothing; every upload that reaches step 5 spends one token, even if it
+`upload_rate` per minute. Uploads rejected before step 4 of the check order
+spend nothing; every upload that reaches step 4 spends one token, even if it
 later fails with `413`, `507`, or `408`. The rate caps how hard a leaked token can hit the server and bounds
 tombstone growth.
 
@@ -537,10 +520,6 @@ max_files                = 1000
 min_free_space           = "5GiB"
 min_free_inodes          = 10000
 
-failure_budget           = 20          # failed requests per client ...
-failure_window           = "1m"        # ... within this window
-failure_lockout          = "10m"
-max_tracked_ips          = 10000
 upload_rate              = 60          # uploads per agent per minute
 max_concurrent_uploads   = 32
 max_uploads_per_agent    = 8
@@ -598,7 +577,6 @@ changes.
 | `expired_undownloaded` | counter | `agent` | sweeper expires a file never downloaded |
 | `revoke` | counter | `agent`, `result` | each DELETE |
 | `throttled` | counter | `reason` | each `429` or `503` from a limiter |
-| `ip_lockout` | counter | — | each time a client key is locked out |
 | `stored_bytes` | gauge | `agent`, plus `total` | each sweep |
 | `live_files` | gauge | — | each sweep |
 | `tombstones` | gauge | — | each sweep |
@@ -609,7 +587,7 @@ changes.
 still produces exactly one event, with `result=client_aborted`.
 
 `agent` is `-` when no valid token was presented. `reason` is one of
-`ip_lockout`, `upload_rate`, `uploads_per_agent`, `uploads_total`,
+`upload_rate`, `uploads_per_agent`, `uploads_total`,
 `downloads_per_ip`, `downloads_total`.
 
 Every `GET /d/...` emits `download` exactly once: rejected requests when they are
@@ -636,7 +614,6 @@ first-download time was not persisted and is unknown.
 | `410` | `gone` | — |
 | `413` | `too_large` | — |
 | `416` | `range_not_satisfiable` | — |
-| `429` from IP lockout | `rate_limited` | `ip_lockout` |
 | `429` from upload rate | `rate_limited` | `upload_rate` |
 | `429` from per-agent uploads | `busy` | `uploads_per_agent` |
 | `429` from per-key downloads | `busy` | `downloads_per_ip` |
@@ -677,7 +654,6 @@ reads those logs.
 |---|---|
 | `main.rs` | CLI (`serve`, `token`), startup, shutdown |
 | `app.rs` | `AppState` and router assembly |
-| `gate.rs` | Middleware: client key, optional token, lockout, failure-budget charging |
 | `range.rs` | Single-range `Range` parsing per the rules above |
 | `config.rs` | Parse and validate TOML; size and duration types |
 | `auth.rs` | Token hashing and lookup; `Agent` extractor |
@@ -686,7 +662,7 @@ reads those logs.
 | `store.rs` | Blob and metadata files, index and its states, reservations, recovery |
 | `upload.rs` | PUT handler and fallback: check order, streaming, hashing, limits, timeouts, commit task |
 | `download.rs` | GET, HEAD, and DELETE handlers; range serving; cancellation |
-| `limits.rs` | Failure-budget table, upload rate, concurrency caps and their guards |
+| `limits.rs` | Upload rate, concurrency caps, and their guards |
 | `sweeper.rs` | Expiry, tombstone removal, gauge emission; `run_once()` for tests |
 | `obs.rs` | Metric event helpers |
 | `clock.rs` | `Clock` trait; system clock and a test clock |
@@ -743,7 +719,8 @@ use `tower-http`.
   Without `proxy_http_version 1.1`, nginx writes every `curl -T -` upload to
   its own disk before forwarding it. That space escapes filepass's quotas and
   free-space floor. Without the `X-Forwarded-For` line, nginx sends no client
-  IP, and every client shares the proxy's address and one failure budget.
+  IP, and every client shares the proxy's address and one per-client download
+  limit.
 
   Caddy needs no body-size setting. filepass's producer task enforces its own
   download idle timeout, so neither proxy's send timeout is load-bearing. Its `reverse_proxy` sets
@@ -760,7 +737,7 @@ Integration tests start the real server on a random port with a temp
 - `curl -T file URL/` and `curl -T - URL/name` both work, run with the real
   curl binary. An empty file round-trips.
 - Routing: `PUT /` and `PUT /d/a/b` return `400`; `PUT /healthz` uploads a
-  file; `POST /x` returns `405`; none charges the budget.
+  file; `POST /x` returns `405`.
 - Upload check order: each step's status wins over every later step's.
 - `Filepass-TTL`: default, explicit, over the cap, zero, malformed.
 - `401` without a token or with a bad one.
@@ -802,11 +779,8 @@ Integration tests start the real server on a random port with a temp
   trusted peer, the rightmost untrusted entry wins; IPv6 keys by /64;
   bare-address `trusted_proxies` entries parse; IPv4-mapped addresses match
   their IPv4 form.
-- Failure budget: lockout after the budget, `429` for tokenless requests, a
-  valid token bypasses it on uploads, revokes, and downloads, it lifts after `failure_lockout`, other keys are
-  unaffected.
-- The IP table stays within `max_tracked_ips` and keeps active lockouts.
-- Upload rate: `429` once the bucket empties; requests rejected before step 5
+- The per-key download table empties when downloads finish.
+- Upload rate: `429` once the bucket empties; requests rejected before step 4
   spend nothing.
 - Tombstones beyond `max_tombstones` are evicted oldest first.
 - Response headers: `nosniff`, `attachment`, octet-stream, `no-referrer`.
