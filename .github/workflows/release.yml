@@ -1,0 +1,44 @@
+name: Release
+
+# Tag vX.Y.Z (matching Cargo.toml's version) to publish a GitHub Release with the
+# static Linux binary and its SHA-256. Deployments pin both.
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+      - name: Check the tag matches Cargo.toml
+        run: |
+          want="v$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)"
+          [ "$want" = "$GITHUB_REF_NAME" ] || { echo "tag $GITHUB_REF_NAME != Cargo.toml $want"; exit 1; }
+      - name: Install musl-tools
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - name: Test
+        run: cargo test
+      - name: Build release binary
+        run: cargo build --release --target x86_64-unknown-linux-musl
+      - name: Package
+        run: |
+          asset=filepass-x86_64-unknown-linux-musl
+          cp target/x86_64-unknown-linux-musl/release/filepass "$asset"
+          sha256sum "$asset" > "$asset.sha256"
+          cat "$asset.sha256"
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            filepass-x86_64-unknown-linux-musl \
+            filepass-x86_64-unknown-linux-musl.sha256 \
+            --title "$GITHUB_REF_NAME" --generate-notes
