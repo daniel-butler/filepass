@@ -1,7 +1,7 @@
 # filepass — design
 
 Date: 2026-10-07
-Status: draft, revised after two reviews and a threat-model pass, awaiting approval
+Status: draft, revised after three reviews and a threat-model pass, awaiting approval
 License: MIT
 Repo: `daniel-butler/filepass`
 
@@ -61,12 +61,12 @@ query string stops curl from appending the filename.
 - **TTL:** the `Filepass-TTL` header is optional, a humantime duration such as
   `10m` or `4h`. The default is `default_ttl` (30m). Zero, values above
   `max_ttl` (24h), and unparseable values return `400`.
-- **Path:** exactly one non-empty segment. An explicit `PUT` fallback route
-  answers `PUT /` with `400` and the body
-  `name the file: PUT /<filename> (curl -T - needs an explicit name)`, and
-  answers paths with more than one segment with `400`. These `400`s do not
-  charge the failure budget. `PUT /healthz` uploads a file named `healthz`
-  like any other name.
+- **Path:** exactly one non-empty segment. `PUT /` returns `400` with the
+  body `name the file: PUT /<filename> (curl -T - needs an explicit name)`;
+  a `PUT` to any path with more than one segment returns `400`. Both run check
+  steps 1–2 first, so an untokened request gets `401`. `PUT /healthz` uploads
+  a file named `healthz` like any other name. See Routing for how axum is
+  wired to deliver these responses.
 - **Filename:** the segment, percent-decoded. filepass returns `400` when the
   decoded bytes are not valid UTF-8; when the name is `.` or `..`; when it
   contains `/` or `\`; when it contains a C0 control (U+0000–U+001F), DEL
@@ -99,6 +99,22 @@ first failure:
 7. Declared length or a new file over any quota → `507`
 8. Read the body; limits are re-checked as bytes arrive (see Space protection)
 
+### Routing
+
+axum matches the path before the method, so a method mismatch on a matched
+path yields `405`, not the router fallback. filepass wires routes explicitly:
+
+| Route | Methods |
+|---|---|
+| `/healthz` | `GET` → health; `PUT` → upload |
+| `/{filename}` | `PUT` → upload |
+| `/d/{id}/{urlname}` | `GET`, `HEAD` → download; `DELETE` → revoke; `PUT` → `400` (multi-segment path) |
+| fallback (`PUT`) | `PUT /` and deeper paths → `400` |
+| fallback (other) | `404` |
+
+Any other method on a matched path returns `405`. `400` and `405` never charge
+the failure budget: neither reveals anything about tokens or ids.
+
 ### Download: `GET /d/{id}/{urlname}` (also `HEAD`)
 
 ```
@@ -107,6 +123,8 @@ curl -C - -fO https://filepass.host/d/3f9c.../build.zip   # resume
 ```
 
 - **No auth.** Possession of the URL grants access until expiry or revocation.
+  A download may carry an agent's `Authorization` header; it changes nothing
+  except that a valid token bypasses an IP lockout (see Abuse protection).
 - `{id}` is 128 random bits as 32 lowercase hex characters. It cannot be
   guessed, so the URL itself is the credential.
 - `{urlname}` must equal the stored URL-safe name; a mismatch returns `404`.
@@ -122,6 +140,16 @@ curl -C - -fO https://filepass.host/d/3f9c.../build.zip   # resume
 
   filepass never lets a browser render an uploaded file inline, so an uploaded
   `.html` or `.svg` cannot run script on the server's origin.
+- **Check order.** filepass evaluates a download in this order and stops at
+  the first failure:
+  1. IP lockout, unless the request carries a valid token → `429`
+  2. `{id}` not 32 lowercase hex, unknown id, or name mismatch → `404`
+  3. State not `live`, or now past `expires_at` → `410`
+  4. `Range` unsatisfiable → `416`
+  5. `GET` only: client key at `max_downloads_per_ip` → `429`; server at
+     `max_concurrent_downloads` → `503`
+  6. Open the file and serve it; the file vanishing between step 3 and the
+     open → `410`
 - **Expiry mid-download:** a download in progress when the file expires
   finishes, subject to `max_download_duration`.
 - **Revoke mid-download:** revocation aborts every download of that file in
@@ -131,7 +159,7 @@ curl -C - -fO https://filepass.host/d/3f9c.../build.zip   # resume
   checks pass, so invalid requests never consume one. `HEAD` takes no slot.
   At most `max_concurrent_downloads` (64) run server-wide, beyond which
   filepass returns `503`; at most `max_downloads_per_ip` (8) run per client
-  IP, beyond which it returns `429`.
+  key, beyond which it returns `429`.
 - **Timeouts.** A download whose client accepts no bytes for
   `download_idle_timeout` (60s), or that runs longer than
   `max_download_duration` (2h), is dropped. A slow reader cannot hold a slot,
@@ -162,12 +190,13 @@ Returns `200 ok`. No auth.
 | 401 | Missing or unknown token |
 | 403 | DELETE by an agent that did not upload the file |
 | 404 | Unknown id, or name mismatch |
+| 405 | Method not allowed on a matched path |
 | 408 | Upload stalled or exceeded `max_upload_duration` |
 | 410 | The file existed but has expired or been revoked |
 | 413 | Larger than `max_file_size` |
 | 416 | Unsatisfiable range |
 | 429 | IP locked out; or a per-agent or per-IP limit reached |
-| 500 | Disk or I/O error; logged with detail, never the id |
+| 500 | Disk or I/O error; logged with detail and the id prefix, never the full id |
 | 503 | A server-wide concurrency limit reached |
 | 507 | Would exceed the agent quota, `max_files`, the total quota, or the free-space floor |
 
@@ -233,18 +262,45 @@ Each index entry has an in-memory state: `live`, `ending`, `expired`, or
 
 To revoke or expire a file:
 
-1. **Under the lock**, move the entry from `live` to `ending`. If it is not
-   `live`, stop: a revoke answers `410`, and the sweeper skips it. This flip,
-   not the disk write, is what blocks new downloads and makes concurrent
-   revokes and sweeps race-free; exactly one caller wins.
-2. Write the `.json` with the final `state` and `ended_at`.
-3. Fire the file's cancellation token (revoke only), aborting its downloads.
-4. Unlink `files/{id}` and fsync `files/`.
+1. **Under the lock**, move the entry from `live` to `ending`, record the
+   target state and `ended_at`, and release the file's quota bytes and file
+   slot. If the entry is not `live`, stop: a revoke answers `410`, and the
+   sweeper skips it. This flip, not the disk write, is what blocks new
+   downloads and makes concurrent revokes and sweeps race-free; exactly one
+   caller wins.
+2. Fire the file's cancellation token (revoke only), aborting its downloads at
+   once, before any I/O can fail.
+3. Write the `.json` with the final `state` and `ended_at`.
+4. Unlink `files/{id}` (ENOENT counts as success) and fsync `files/`.
 5. Under the lock, set the entry to `expired` or `revoked`.
+
+A revoke answers `204` only after step 3 is on disk. If step 3 or 4 fails, the
+entry stays `ending`, the revoke answers `500`, and the link stays dead in
+memory. The sweeper retries steps 3–5 for every entry that has been `ending`
+for over 60 seconds, so no entry stays stuck. A repeated DELETE meanwhile
+answers `410`.
 
 Downloads treat `ending` like `expired`/`revoked`: `410`. Writing the state
 before unlinking means a crash can leave an orphaned blob, which startup
-deletes, but can never bring a revoked file back.
+deletes. A crash before step 3 completes brings the file back as `live` at
+restart; the revoke answered `500`, so the agent knows to repeat it.
+
+### Releasing counters
+
+Every counter filepass increments — per-agent and server-wide uploads, file
+slots, byte reservations, per-key and server-wide download slots — is held by
+an RAII guard whose `Drop` releases it. A client disconnect drops the handler
+future, and only `Drop` runs then, so explicit release calls are not enough.
+
+- Upload guards live in the handler and drop on every exit: success, `4xx`,
+  `5xx`, timeout, or disconnect. A rejection at step 6 or 7 releases the
+  step-4 concurrency guard.
+- On success, the byte reservation converts into the file's committed usage
+  under the index lock, in the same step that inserts the entry.
+- If the `.json` write fails after the blob was renamed into `files/`,
+  filepass unlinks the blob and answers `500`.
+- Download guards move into the producer task (see Code layout), not the
+  handler, because the response body outlives the handler.
 
 ### Startup recovery
 
@@ -258,7 +314,7 @@ Recovery runs to completion before the listener binds.
 | A `.json` that fails to parse | Delete it and its blob; log a warning |
 | `expired`/`revoked` `.json` whose blob still exists | Delete the blob |
 | `live` `.json` with no blob | Mark `expired`, `ended_at` = now |
-| `live` `.json` past `expires_at` | End it as expired (steps 2–4 above) |
+| `live` `.json` past `expires_at` | End it as expired (steps 3–4 above), `ended_at` = `expires_at` |
 | `expired`/`revoked` `.json` past `ended_at + tombstone_ttl` | Delete |
 
 ### Permissions
@@ -272,23 +328,24 @@ built only from hex ids, so names cannot traverse or follow symlinks.
 The index holds every `.json` loaded at startup and updated since. It answers
 lookups, tracks per-agent bytes and live-file counts, holds reservations, and
 drives expiry. Each live file also carries, in memory only, a cancellation
-token, its first-download time, an in-flight download count, and whether it
-was loaded at startup.
+token, its first-download time, and whether it was loaded at startup.
 
 ### Expiry
 
 A sweeper runs every 60 seconds. For each `live` entry past `expires_at` it
-ends the file as expired. For each `expired` or `revoked` entry past
+ends the file as expired. It retries every entry stuck in `ending` for over
+60 seconds. For each `expired` or `revoked` entry past
 `ended_at + tombstone_ttl` (48h) it deletes the `.json`, after which the id
 returns `404`.
 
 Downloads also check `expires_at` directly, so a file is unreachable the moment
 it expires, even before the sweeper runs.
 
-Tombstones do not count toward `max_files`. The upload rate bounds them: at
-most `upload_rate × 60 × 48` (172,800) per agent at the defaults. As a
-backstop, when tombstones exceed `max_tombstones` (200,000) the sweeper deletes
-the oldest; those ids return `404` early.
+Tombstones do not count toward `max_files`. The upload rate bounds them: a
+file can stay live 24h and then remain a tombstone 48h, so at most
+`upload_rate × 60 × 72` (259,200) per agent at the defaults. Realistic use
+stays far below that. `max_tombstones` (200,000) caps them server-wide: when
+exceeded, the sweeper deletes the oldest, and those ids return `404` early.
 
 ### Space protection
 
@@ -297,7 +354,7 @@ Every upload passes these limits:
 - `max_file_size` (2 GiB)
 - `agent_quota` (10 GiB) bytes per agent, live files plus reservations
 - `max_files` (1000) live files per agent, plus uploads in progress
-- `total_quota` (50 GiB), all agents
+- `total_quota` (50 GiB), all agents, live files plus reservations
 - `min_free_space` (5 GiB), measured with `nix::sys::statvfs`
 
 The free-space check accounts for bytes promised but not yet written:
@@ -305,6 +362,9 @@ The free-space check accounts for bytes promised but not yet written:
 ```
 f_bavail × f_frsize − Σ(reserved − written) − incoming ≥ min_free_space
 ```
+
+`incoming` is the declared `Content-Length` when the upload starts, and the
+next 1 MiB on each re-check of a streamed upload.
 
 How filepass enforces the limits:
 
@@ -328,7 +388,9 @@ on a firewall or fail2ban.
 ### Client IP
 
 filepass trusts forwarding headers only from `trusted_proxies` (default
-`127.0.0.1` and `::1`). When the socket peer is a trusted proxy, the client IP
+`127.0.0.1` and `::1`). Entries are CIDRs or bare addresses; a bare address
+means /32 or /128. filepass normalises IPv4-mapped IPv6 addresses with
+`to_canonical()` before every match and before keying. When the socket peer is a trusted proxy, the client IP
 is the rightmost `X-Forwarded-For` entry that is not itself a trusted proxy.
 Otherwise the client IP is the socket peer, and filepass ignores any
 `X-Forwarded-For` the client sent. The proxy must overwrite the header, not
@@ -356,8 +418,9 @@ lockout only when every tracked key is locked out.
 ### Upload rate per agent
 
 Each agent has a token bucket of capacity `upload_rate` (60), refilling at
-`upload_rate` per minute. Only uploads that pass auth and validation spend a
-token. The rate caps how hard a leaked token can hit the server and bounds
+`upload_rate` per minute. Uploads rejected before step 5 of the check order
+spend nothing; every upload that reaches step 5 spends one token, even if it
+later fails with `413`, `507`, or `408`. The rate caps how hard a leaked token can hit the server and bounds
 tombstone growth.
 
 ### Concurrency
@@ -378,6 +441,10 @@ file grants no access.
 
 SHA-256 suffices because tokens carry 256 bits of entropy. Slow hashes such
 as Argon2 protect low-entropy passwords from guessing; they add nothing here.
+
+Agent names match `[a-z0-9][a-z0-9_-]{0,31}`, and `total` is reserved. This
+keeps them safe as metric label values: no agent can collide with the `-`
+or `total` labels.
 
 `filepass token` prints a new token and its hash. The operator puts the hash
 in the config and gives the token to the agent. Adding or removing an agent
@@ -430,17 +497,18 @@ token_sha256 = "77ae…"
 
 filepass validates the config at startup and refuses to run on errors:
 
-- unknown keys, a malformed `public_url`, duplicate token hashes, or an
-  unparseable `trusted_proxies` entry;
+- unknown keys, a malformed `public_url`, duplicate token hashes, an invalid
+  agent name, or an unparseable `trusted_proxies` entry;
 - `default_ttl` above `max_ttl`;
 - any duration, count, size, or rate that is zero, except `min_free_space`.
 
 ## Shutdown
 
-On SIGTERM filepass stops accepting connections and wraps axum's graceful
-shutdown in `tokio::time::timeout(shutdown_grace)`; axum's own graceful
-shutdown waits indefinitely. When the grace period (30s) ends, filepass exits
-regardless. Keep `shutdown_grace` below systemd's `TimeoutStopSec` (default
+On SIGTERM filepass triggers axum's graceful shutdown, which stops accepting
+connections, and then races the serve future against
+`tokio::time::sleep(shutdown_grace)`. axum's own graceful shutdown waits
+indefinitely; the race starts only after SIGTERM, never at startup. When the
+grace period (30s) ends, filepass exits regardless. Keep `shutdown_grace` below systemd's `TimeoutStopSec` (default
 90s). Interrupted uploads leave temp files, which the next startup deletes.
 
 ## Telemetry
@@ -448,9 +516,12 @@ regardless. Keep `shutdown_grace` below systemd's `TimeoutStopSec` (default
 filepass writes everything through `tracing` to stdout; under systemd it lands
 in journald. `log_format` selects text or JSON. Nothing leaves the server.
 
-It follows the `obs.rs` convention from `running-app-backend-deploy`. A metric
-is one structured event on the `metric` target, paired with a readable log line
-at the same call site. Count the metric; read the log.
+A metric is one structured event on the `metric` tracing target with fields
+`metric=<name>`, its labels, and `value` (`1` for counters; the reading for
+gauges; milliseconds for timings, with `unit="ms"`). Each is paired with a
+readable log line at the same call site: count the metric, read the log. A
+log shipper such as Vector can turn these events into counters without code
+changes.
 
 ### Metric events
 
@@ -459,7 +530,7 @@ at the same call site. Count the metric; read the log.
 | `upload` | counter | `agent`, `result` | each upload attempt |
 | `upload_bytes` | counter | `agent` | each successful upload |
 | `upload_duration_ms` | timing | `agent` | each successful upload |
-| `download` | counter | `result` | each download request |
+| `download` | counter | `result` | once per download request, when it ends |
 | `download_bytes` | counter | — | bytes sent, at the end of each download |
 | `time_to_first_download_ms` | timing | `agent` | first download of a file |
 | `expired_undownloaded` | counter | `agent` | sweeper expires a file never downloaded |
@@ -476,9 +547,13 @@ at the same call site. Count the metric; read the log.
 `ip_lockout`, `upload_rate`, `uploads_per_agent`, `uploads_total`,
 `downloads_per_ip`, `downloads_total`.
 
-A **download** is a `GET` answered `200` or `206`. `HEAD` requests do not
-count. The first such response sets a file's first-download time. Range resumes
-count as further downloads but never reset that time.
+Every `GET` emits `download` exactly once: rejected requests when they are
+rejected, served requests from the producer task's guard when the transfer
+ends (`ok`, `client_aborted`, `revoked`, `timeout`, or `error`). `HEAD`
+requests emit nothing.
+
+The first `GET` answered `200` or `206` sets a file's first-download time.
+Range resumes never reset it.
 
 `expired_undownloaded` skips files loaded at startup, because their
 first-download time was not persisted and is unknown.
@@ -533,12 +608,24 @@ reads those logs.
 by path after the handler's index check, so a concurrent revoke or expiry turns
 an intended `410` into `404`. It also emits its own ETag and Last-Modified.
 filepass instead opens the file descriptor while holding the index entry,
-maps a vanished file to `410`, parses `Range` with the `http-range-header`
-crate, and streams the descriptor with
-`tokio_util::io::ReaderStream::with_capacity(file, 256 * 1024)`. The default
-4 KiB buffer would mean half a million blocking reads per 2 GiB file. The
-stream stops when the file's cancellation token fires, the client stalls past
-`download_idle_timeout`, or the transfer passes `max_download_duration`.
+maps a vanished file to `410`, and parses `Range` with the `http-range-header`
+crate.
+
+**Downloads run in a producer task.** A timer inside the response body cannot
+enforce `download_idle_timeout`: when the client stops reading, hyper's write
+buffer fills and hyper stops polling the body, so the timer never gets to act.
+Instead, the handler spawns a task that owns the file descriptor and the
+download guards. It reads 256 KiB chunks (the 4 KiB default would mean half a
+million blocking reads per 2 GiB file) and sends them into a bounded channel
+of 4 chunks; the response body reads the channel. Each send is wrapped in
+`timeout(download_idle_timeout, tx.send(chunk))`. The task stops — dropping
+the descriptor and releasing its slots — when a send times out, the file's
+cancellation token fires, `max_download_duration` passes, or the client
+disconnects (the receiver drops).
+
+**Uploads stream through `axum::body::Body`**, never `Bytes` or other
+buffering extractors, so axum's 2 MB `DefaultBodyLimit` never applies and no
+upload is held in memory.
 
 Main crates: `axum`, `tokio`, `tokio-util`, `http-range-header`, `sha2`,
 `rand`, `serde`, `serde_json`, `toml`, `humantime`, `tracing`,
@@ -571,7 +658,8 @@ Main crates: `axum`, `tokio`, `tokio-util`, `http-range-header`, `sha2`,
   free-space floor. Without the `X-Forwarded-For` line, nginx sends no client
   IP, and every client shares the proxy's address and one failure budget.
 
-  Caddy needs no body-size setting. Its `reverse_proxy` sets
+  Caddy needs no body-size setting. filepass's producer task enforces its own
+  download idle timeout, so neither proxy's send timeout is load-bearing. Its `reverse_proxy` sets
   `X-Forwarded-For` to the client address and ignores client-supplied values
   unless Caddy's own `trusted_proxies` says otherwise.
 
@@ -583,8 +671,8 @@ Integration tests start the real server on a random port with a temp
 - Upload then download round trip; the SHA-256 header matches the bytes.
 - `curl -T file URL/` and `curl -T - URL/name` both work, run with the real
   curl binary. An empty file round-trips.
-- `PUT /` and multi-segment paths return `400` without charging the budget.
-  `PUT /healthz` uploads a file.
+- Routing: `PUT /` and `PUT /d/a/b` return `400`; `PUT /healthz` uploads a
+  file; `POST /x` returns `405`; none charges the budget.
 - Upload check order: each step's status wins over every later step's.
 - `Filepass-TTL`: default, explicit, over the cap, zero, malformed.
 - `401` without a token or with a bad one.
@@ -601,18 +689,27 @@ Integration tests start the real server on a random port with a temp
 - Concurrent revokes, and a revoke racing the sweeper: exactly one wins; the
   other gets `410` or skips.
 - Revoke aborts a download in progress.
+- A failed `.json` write during revoke answers `500`, keeps the link dead, and
+  the sweeper completes the revoke on retry.
+- A download whose client stops reading releases its slot and descriptor
+  after `download_idle_timeout`.
+- Every counter returns to zero after uploads and downloads that succeed,
+  fail at each check step, time out, or disconnect.
 - Range request returns the requested slice; resume reassembles the file;
   an unsatisfiable range returns `416`.
 - Download limits: `503` server-wide, `429` per IP; invalid requests and
   `HEAD` take no slot; `max_download_duration` drops a slow reader.
 - Upload concurrency: `429` per agent, `503` server-wide.
 - Client IP: `X-Forwarded-For` from an untrusted peer is ignored; from a
-  trusted peer, the rightmost untrusted entry wins; IPv6 keys by /64.
+  trusted peer, the rightmost untrusted entry wins; IPv6 keys by /64;
+  bare-address `trusted_proxies` entries parse; IPv4-mapped addresses match
+  their IPv4 form.
 - Failure budget: lockout after the budget, `429` for tokenless requests, a
-  valid token bypasses it, it lifts after `failure_lockout`, other keys are
+  valid token bypasses it on uploads, revokes, and downloads, it lifts after `failure_lockout`, other keys are
   unaffected.
 - The IP table stays within `max_tracked_ips` and keeps active lockouts.
-- Upload rate: `429` once the bucket empties; rejected requests spend nothing.
+- Upload rate: `429` once the bucket empties; requests rejected before step 5
+  spend nothing.
 - Tombstones beyond `max_tombstones` are evicted oldest first.
 - Response headers: `nosniff`, `attachment`, octet-stream, `no-referrer`.
 - Startup recovery: every row of the recovery table.
