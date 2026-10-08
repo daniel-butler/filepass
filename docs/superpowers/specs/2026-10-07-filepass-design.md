@@ -1,7 +1,7 @@
 # filepass — design
 
 Date: 2026-10-07
-Status: draft, revised after five reviews and a threat-model pass, awaiting approval
+Status: approved
 License: MIT
 Repo: `daniel-butler/filepass`
 
