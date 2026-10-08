@@ -326,12 +326,14 @@ impl Store {
 mod tests {
     use super::*;
 
+    use std::collections::VecDeque;
     use std::fs;
-    use std::sync::Arc;
+    use std::sync::{mpsc, Arc, Mutex};
     use std::time::Duration;
 
+    use crate::clock::{Clock, TestClock};
     use crate::store::tests::{dir_entries, harness, upload, Harness};
-    use crate::store::{DiskState, Lookup, Meta};
+    use crate::store::{DiskState, Lookup, Meta, Store};
 
     fn json_path(h: &Harness, id: &str) -> std::path::PathBuf {
         h.dir.path().join("files").join(format!("{id}.json"))
@@ -538,6 +540,136 @@ mod tests {
         assert_eq!((revoked, gone), (1, 7), "{outcomes:?}");
         assert_eq!(on_disk(&h, &meta.id).state, DiskState::Revoked);
         assert_eq!(h.store.stats().total_bytes, 0);
+    }
+
+    /// A `TestClock` whose next `now()` calls can each be held, after the
+    /// time is read and before it is returned, until the test releases
+    /// them. This pins down the window between a caller reading the clock
+    /// and taking the index lock, which a real scheduler interleaves at
+    /// random.
+    struct GatedClock {
+        inner: Arc<TestClock>,
+        gates: Mutex<VecDeque<mpsc::Receiver<()>>>,
+    }
+
+    impl GatedClock {
+        /// Holds the next unheld `now()` call until the returned sender is
+        /// used or dropped.
+        fn hold_next(&self) -> mpsc::Sender<()> {
+            let (tx, rx) = mpsc::channel();
+            self.gates.lock().expect("gates").push_back(rx);
+            tx
+        }
+
+        /// Blocks until every armed gate has been taken by a `now()` call.
+        fn wait_until_held(&self) {
+            while !self.gates.lock().expect("gates").is_empty() {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+        }
+    }
+
+    impl Clock for GatedClock {
+        fn now(&self) -> SystemTime {
+            let now = self.inner.now();
+            let gate = self.gates.lock().expect("gates").pop_front();
+            if let Some(gate) = gate {
+                let _ = gate.recv();
+            }
+            now
+        }
+    }
+
+    /// The spec's "a revoke racing the sweeper", on one file both may end:
+    /// the revoke read the clock one second before `expires_at`, the sweep
+    /// read it at `expires_at`, and both then race for the index lock.
+    /// Whichever takes it first wins; the other answers `Gone` or skips,
+    /// and the counters release the file exactly once. `revoke_first`
+    /// picks which caller the test lets through first.
+    async fn race_revoke_and_sweep(revoke_first: bool) {
+        let h = harness(|_| {});
+        let meta = upload(&h, b"abc").await;
+        // Reopen the same data_dir on a gated clock; recovery reloads the
+        // file as live.
+        h.store.unlock_data_dir();
+        let clock = Arc::new(GatedClock {
+            inner: h.clock.clone(),
+            gates: Mutex::new(VecDeque::new()),
+        });
+        let (store, _report) = Store::open(&h.cfg, clock.clone()).expect("reopen");
+        let store = Arc::new(store);
+        let cancel = match store.lookup(&meta.id, "my_file.txt") {
+            Lookup::Live(f) => f.cancel,
+            _ => panic!("expected Live"),
+        };
+
+        h.clock.advance(Duration::from_secs(30 * 60 - 1));
+        let revoke_now = h.clock.now();
+        let release_revoke = clock.hold_next();
+        let revoke = {
+            let store = Arc::clone(&store);
+            let id = meta.id.clone();
+            tokio::spawn(async move { store.revoke(&id, "my_file.txt", "planner").await })
+        };
+        clock.wait_until_held();
+
+        h.clock.advance(Duration::from_secs(1));
+        let release_sweep = clock.hold_next();
+        let sweep = {
+            let store = Arc::clone(&store);
+            tokio::spawn(async move { store.sweep().await })
+        };
+        clock.wait_until_held();
+
+        let (revoked, report) = if revoke_first {
+            drop(release_revoke);
+            let revoked = revoke.await.expect("revoke task");
+            drop(release_sweep);
+            (revoked, sweep.await.expect("sweep task"))
+        } else {
+            drop(release_sweep);
+            let report = sweep.await.expect("sweep task");
+            drop(release_revoke);
+            (revoke.await.expect("revoke task"), report)
+        };
+
+        let disk = on_disk(&h, &meta.id);
+        if revoke_first {
+            assert_eq!(revoked, RevokeOutcome::Revoked);
+            assert!(report.expired.is_empty(), "the sweep must skip it");
+            assert_eq!(disk.state, DiskState::Revoked);
+            assert_eq!(disk.ended_at, Some(revoke_now));
+            assert!(cancel.is_cancelled());
+        } else {
+            assert_eq!(revoked, RevokeOutcome::Gone);
+            assert_eq!(report.expired.len(), 1);
+            assert_eq!(disk.state, DiskState::Expired);
+            assert_eq!(disk.ended_at, Some(meta.expires_at));
+            assert!(!cancel.is_cancelled(), "expiry must not abort downloads");
+        }
+        assert!(!blob_path(&h, &meta.id).exists());
+        assert!(matches!(
+            store.lookup(&meta.id, "my_file.txt"),
+            Lookup::Gone
+        ));
+        let stats = store.stats();
+        assert_eq!(stats.live_files, 0);
+        assert_eq!(stats.tombstones, 1);
+        assert_eq!(stats.total_bytes, 0);
+        assert_eq!(stats.per_agent_bytes.get("planner"), Some(&0));
+        // The loser left nothing half-done for a later sweep to redo.
+        store.age_ending(Duration::from_secs(61));
+        assert_eq!(store.sweep().await, SweepReport::default());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn revoke_racing_sweep_revoke_wins() {
+        race_revoke_and_sweep(true).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn revoke_racing_sweep_sweep_wins() {
+        race_revoke_and_sweep(false).await;
     }
 
     #[tokio::test]
